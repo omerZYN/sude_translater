@@ -399,21 +399,25 @@ def build_machine_toolpath(root_pts, tip_pts, params):
     root_chord = float(np.max(root[:, 0]) - np.min(root[:, 0]))
     tip_chord = float(np.max(tip[:, 0]) - np.min(tip[:, 0]))
 
-    # Taper projection in the local (profile) frame — NO offsets applied yet.
+    # X offsets are applied BEFORE taper projection so that sweep (tip shifted
+    # relative to root in X) is correctly baked into delta = tip - root and
+    # propagates through the triangle-similarity extrapolation. This is what
+    # lets the user align trailing edges on a tapered wing by setting
+    # tip_x_offset = root_chord - tip_chord (plus any root_x_offset).
+    root[:, 0] += root_x_offset
+    tip[:, 0] += tip_x_offset
+
+    # Taper projection in the (now shifted) profile frame
     left, right = apply_taper_projection(
         root, tip, span, foam_width, foam_left_offset
     )
     left = left.copy()
     right = right.copy()
 
-    # Option B: offsets translate each carriage path as a whole unit. After
-    # normalization the profile's bounding-box lower-left corner is at (0,0)
-    # locally, so shifting by the offsets places that corner at the user-
-    # specified (offset_X, offset_Y). The profile stays entirely in positive
-    # territory when both offsets are non-negative.
-    left[:, 0] += root_x_offset
+    # Y offsets are applied at the carriage level (post-projection). They just
+    # lift each carriage's cut path vertically; they don't participate in the
+    # taper extrapolation because the wire doesn't "tilt" in Y due to offsets.
     left[:, 1] += root_y_offset
-    right[:, 0] += tip_x_offset
     right[:, 1] += tip_z_offset
 
     return {
@@ -1551,8 +1555,38 @@ class HotWireCutterApp:
         ax.set_xlabel("X / A (mm)", color="white", fontsize=10)
         ax.set_ylabel("Span (mm)", color="white", fontsize=10)
         ax.set_zlabel("Y / Z (mm)", color="white", fontsize=10)
-        ax.set_title("Toolpath Onay Penceresi - Iki Carriage",
-                     color="white", fontsize=13, pad=10)
+
+        # SolidWorks-style view presets keyed to Space / 1-4:
+        #   1 = Iso, 2 = On, 3 = Ust, 4 = Yan, Space cycles through
+        view_presets = [
+            ("Iso",  30, -45),   # default perspective
+            ("On",    0, -90),   # front: chord + height (XY profile shape)
+            ("Ust",  90, -90),   # top:   chord + span   (looking down Z)
+            ("Yan",   0,   0),   # side:  span + height  (wire direction)
+        ]
+        view_state = {"idx": 0}
+
+        def _apply_view(idx):
+            idx = idx % len(view_presets)
+            view_state["idx"] = idx
+            name, elev, azim = view_presets[idx]
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_title(
+                f"Toolpath Onay - {name}   "
+                f"(Space: sonraki gorunum  |  1=Iso 2=On 3=Ust 4=Yan)",
+                color="white", fontsize=11, pad=10,
+            )
+            canvas_widget.draw()
+
+        def _cycle(_event=None):
+            _apply_view(view_state["idx"] + 1)
+
+        # Initial view + title hint
+        ax.set_title(
+            "Toolpath Onay - Iso   "
+            "(Space: sonraki gorunum  |  1=Iso 2=On 3=Ust 4=Yan)",
+            color="white", fontsize=11, pad=10,
+        )
         ax.tick_params(colors="white", labelsize=8)
         ax.xaxis.pane.fill = False
         ax.yaxis.pane.fill = False
@@ -1625,6 +1659,23 @@ class HotWireCutterApp:
 
         # Cancel on window-close as well
         win.protocol("WM_DELETE_WINDOW", _cancel)
+
+        # SolidWorks-style keyboard view shortcuts.
+        # Bind to the Toplevel so they work anywhere inside the window; also
+        # to the canvas widget so clicks inside matplotlib don't lose focus.
+        def _key_handler(event):
+            k = event.keysym.lower()
+            if k == "space":
+                _cycle()
+            elif k in ("1", "2", "3", "4"):
+                _apply_view(int(k) - 1)
+
+        win.bind("<Key>", _key_handler)
+        canvas_widget.get_tk_widget().bind("<Key>", _key_handler)
+        canvas_widget.get_tk_widget().bind(
+            "<Button-1>", lambda e: canvas_widget.get_tk_widget().focus_set()
+        )
+        win.focus_set()
 
     def _save(self):
         """Save generated G-code to .nc file."""
