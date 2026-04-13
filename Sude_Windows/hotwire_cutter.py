@@ -336,12 +336,17 @@ def build_machine_toolpath(root_pts, tip_pts, params):
     """Apply kerf, X offsets, taper projection and Y/Z offsets to produce the
     final machine-coordinate toolpath for both carriages.
 
+    Cut flow convention: the machine starts and ends at (0,0,0,0) = motor home.
+    A LEAD-IN cut line goes from (0,0) straight to the first profile point,
+    then the profile is cut clockwise, then a LEAD-OUT cut line retraces back
+    to (0,0). Both the lead-in and lead-out are regular G01 cut moves at the
+    feed rate (hotwire is always hot), and they cut a thin slot from home to
+    the profile start.
+
     Returns a dict with:
       left:        Nx2 array, (X, Y) points for the left (root) carriage
       right:       Nx2 array, (A, Z) points for the right (tip) carriage
-      approach:    (x, y, z, a) tuple — rapid move before cut (safe_y below start)
-      retract_via: (x, y, z, a) tuple — rapid move after cut (same as approach)
-      retract_home:(0, 0, 0, 0)
+      home:        (0, 0, 0, 0) — constant, kept for symmetry with render code
       root_chord:  chord length after kerf, before taper projection
       tip_chord:   same for tip
       total_offset: kerf + wire tolerance
@@ -358,7 +363,6 @@ def build_machine_toolpath(root_pts, tip_pts, params):
     tip_z_offset = params.get("tip_z_offset", 0.0)
     kerf = params["kerf"]
     wire_tol = params.get("wire_tolerance", 0.0)
-    safe_y = params["safe_y"]
 
     root = root_pts.copy().astype(float)
     tip = tip_pts.copy().astype(float)
@@ -388,19 +392,10 @@ def build_machine_toolpath(root_pts, tip_pts, params):
     left[:, 1] += root_y_offset
     right[:, 1] += tip_z_offset
 
-    # Approach / retract positions (safe_y below the first cut point)
-    start_x = float(left[0, 0])
-    start_y = float(left[0, 1])
-    start_a = float(right[0, 0])
-    start_z = float(right[0, 1])
-    approach = (start_x, start_y - safe_y, start_z - safe_y, start_a)
-
     return {
         "left": left,
         "right": right,
-        "approach": approach,
-        "retract_via": approach,
-        "retract_home": (0.0, 0.0, 0.0, 0.0),
+        "home": (0.0, 0.0, 0.0, 0.0),
         "root_chord": root_chord,
         "tip_chord": tip_chord,
         "total_offset": total_offset,
@@ -419,7 +414,6 @@ def generate_gcode(root_pts, tip_pts, params):
     tip_z_offset = params.get("tip_z_offset", 0.0)
     kerf = params["kerf"]
     wire_tol = params.get("wire_tolerance", 0.0)
-    safe_y = params["safe_y"]
     profile_name = params.get("profile_name", "Profil")
 
     tp = build_machine_toolpath(root_pts, tip_pts, params)
@@ -429,7 +423,6 @@ def generate_gcode(root_pts, tip_pts, params):
     root_chord = tp["root_chord"]
     tip_chord = tp["tip_chord"]
     total_offset = tp["total_offset"]
-    approach = tp["approach"]
 
     # Build G-code lines
     lines = []
@@ -452,19 +445,29 @@ def generate_gcode(root_pts, tip_pts, params):
     lines.append("G49 (Cancel offsets)")
     lines.append("()")
 
-    # Start position - approach below the first cut point by safe_y
+    # Start position - machine home (0, 0, 0, 0)
     # Axis mapping for Grbl HotWire 6.5:
     #   X = root horizontal (left), Y = root vertical (left)
     #   A = tip horizontal (right), Z = tip vertical (right)
-    ap_x, ap_y, ap_z, ap_a = approach
+    start_x = float(left[0][0])
+    start_y = float(left[0][1])
+    start_a = float(right[0][0])
+    start_z = float(right[0][1])
+
+    lines.append("(Baslangic - Motor home: X0 Y0 Z0 A0)")
+    lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
+    lines.append("()")
+
+    # Lead-in cut: straight G01 from home to the first profile point (CW start).
+    # Hotwire is always hot so this is a regular feed-rate move.
+    lines.append("(Lead-in: (0,0) -> profil orta-alt baslangic noktasi)")
     lines.append(
-        f"(Baslangic - Profil orta noktasinin {safe_y:.2f}mm altinda, saat yonunde kesim)"
+        f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
     )
-    lines.append(f"G00 X{ap_x:.2f} Y{ap_y:.2f} Z{ap_z:.2f} A{ap_a:.2f}")
     lines.append("()")
 
     # Cutting pass — walk every point in the prepared (CW, mid-lower start) order
-    lines.append(f"(Kesim Basliyor - Hiz F{feed})")
+    lines.append(f"(Kesim Basliyor - Hiz F{feed} - Saat Yonu)")
     for i in range(len(left)):
         x = left[i][0]       # left horizontal
         y = left[i][1]       # left vertical (root_y_offset already baked in)
@@ -473,36 +476,43 @@ def generate_gcode(root_pts, tip_pts, params):
         lines.append(f"G01 X{x:.2f} Y{y:.2f} Z{z:.2f} A{a:.2f} F{feed}")
 
     # Close the profile - return to first cutting point
-    x = left[0][0]
-    y = left[0][1]
-    a = right[0][0]
-    z = right[0][1]
-    lines.append(f"G01 X{x:.2f} Y{y:.2f} Z{z:.2f} A{a:.2f} F{feed}")
+    lines.append(
+        f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
+    )
     lines.append("()")
 
-    # Retract: pull down below the profile, then home
+    # Lead-out: retrace the same line back to home (0, 0)
+    lines.append("(Lead-out: profil baslangic noktasi -> (0,0))")
+    lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Kesim Bitti)")
-    lines.append(f"G00 X{ap_x:.2f} Y{ap_y:.2f} Z{ap_z:.2f} A{ap_a:.2f}")
-    lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
 
     return "\n".join(lines)
 
 
 def generate_spar_gcode(root_pts, tip_pts, params):
-    """Generate G-code section for spar hole cutting."""
+    """Generate G-code section for spar hole cutting.
+    Same home -> lead-in -> CW cut -> lead-out -> home pattern as the main."""
     tp = build_machine_toolpath(root_pts, tip_pts, params)
     left = tp["left"]
     right = tp["right"]
     feed = tp["feed"]
-    ap_x, ap_y, ap_z, ap_a = tp["approach"]
+
+    start_x = float(left[0][0])
+    start_y = float(left[0][1])
+    start_a = float(right[0][0])
+    start_z = float(right[0][1])
 
     lines = []
     lines.append("()")
     lines.append("(=== SPAR DELIGI KESIMI ===)")
-
-    lines.append(f"G00 X{ap_x:.2f} Y{ap_y:.2f} Z{ap_z:.2f} A{ap_a:.2f}")
+    lines.append("(Spar baslangic - Motor home)")
+    lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
+    lines.append("(Spar Lead-in: (0,0) -> spar orta-alt)")
+    lines.append(
+        f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
+    )
     lines.append("()")
-    lines.append(f"(Spar Kesim Basliyor - Hiz F{feed})")
+    lines.append(f"(Spar Kesim Basliyor - Hiz F{feed} - Saat Yonu)")
 
     for i in range(len(left)):
         x = left[i][0]
@@ -512,16 +522,14 @@ def generate_spar_gcode(root_pts, tip_pts, params):
         lines.append(f"G01 X{x:.2f} Y{y:.2f} Z{z:.2f} A{a:.2f} F{feed}")
 
     # Close
-    x = left[0][0]
-    y = left[0][1]
-    a = right[0][0]
-    z = right[0][1]
-    lines.append(f"G01 X{x:.2f} Y{y:.2f} Z{z:.2f} A{a:.2f} F{feed}")
+    lines.append(
+        f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
+    )
     lines.append("()")
 
+    lines.append("(Spar Lead-out: spar baslangic -> (0,0))")
+    lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Spar Kesim Bitti)")
-    lines.append(f"G00 X{ap_x:.2f} Y{ap_y:.2f} Z{ap_z:.2f} A{ap_a:.2f}")
-    lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
 
     return "\n".join(lines)
 
@@ -659,11 +667,11 @@ PARAM_TOOLTIPS = {
         "gore deneyerek ayarlanir (tipik 0.5-1.5 mm)."
     ),
     "safe_y": (
-        "Guvenli yukseklik — approach/retract (mm).\n\n"
-        "Kesim baslamadan once ilk kesim noktasinin bu kadar ALTINDA bir "
-        "yaklasim noktasina hizli (G00) gidilir, sonra kesime baslanir. "
-        "Kesim bittiginde ayni sekilde geri cekilir. Kopuk altindan guvenli "
-        "bir girisi/cikisi garantiler."
+        "Guvenli yukseklik (mm) — (su an kullanilmiyor).\n\n"
+        "Yeni akista kesim dogrudan motor home (X0 Y0 Z0 A0) noktasindan "
+        "baslar ve oraya doner; lead-in/lead-out cizgileri tam (0,0)'dan "
+        "profile gider. safe_y parametresi geriye donuk uyumluluk icin "
+        "duruyor, uretilen G-code'a etkisi yok."
     ),
     "num_points": (
         "Nokta sayisi (taper icin).\n\n"
@@ -1369,8 +1377,14 @@ class HotWireCutterApp:
                 spar_gcode = generate_spar_gcode(
                     spar_root.copy(), spar_tip.copy(), params
                 )
+                # Drop the main cut's final lead-out + "Kesim Bitti" lines so
+                # the spar section can pick up from the last profile point,
+                # then append the spar block (which starts with its own
+                # home + lead-in).
                 main_lines = gcode.split("\n")
-                gcode = "\n".join(main_lines[:-2]) + "\n" + spar_gcode
+                # Cut the trailing 2 lines: "(Lead-out ...)" and the G01 home
+                # move, and "(Kesim Bitti)" comment — 3 total to strip.
+                gcode = "\n".join(main_lines[:-3]) + "\n" + spar_gcode
 
             self.generated_gcode = gcode
 
@@ -1423,27 +1437,27 @@ class HotWireCutterApp:
                     color=cut_color_right, linewidth=2,
                     label=f"{label_prefix} Sag Carriage (A,Z)")
 
-            # Approach line - left carriage
-            ap_x, ap_y, ap_z, ap_a = tp["approach"]
-            ax.plot([ap_x, left[0, 0]], [0, 0], [ap_y, left[0, 1]],
-                    color=approach_color, linewidth=1.5, linestyle=":",
-                    label=f"{label_prefix} Yaklasim / Geri Cekilme")
-            # Approach line - right carriage
-            ax.plot([ap_a, right[0, 0]], [span, span], [ap_z, right[0, 1]],
-                    color=approach_color, linewidth=1.5, linestyle=":")
-            # Home retract (0,0,0,0) -> approach
-            ax.plot([0, ap_x], [0, 0], [0, ap_y],
-                    color=approach_color, linewidth=1.0, linestyle=":",
-                    alpha=0.6)
-            ax.plot([0, ap_a], [span, span], [0, ap_z],
-                    color=approach_color, linewidth=1.0, linestyle=":",
-                    alpha=0.6)
+            # Lead-in line: (0,0) -> first profile point for each carriage
+            ax.plot([0, left[0, 0]], [0, 0], [0, left[0, 1]],
+                    color=approach_color, linewidth=1.8, linestyle="--",
+                    label=f"{label_prefix} Lead-in / Lead-out (0,0)")
+            ax.plot([0, right[0, 0]], [span, span], [0, right[0, 1]],
+                    color=approach_color, linewidth=1.8, linestyle="--")
 
-            # Start point markers
+            # (0, 0) home marker — where the cut literally starts
+            ax.scatter([0], [0], [0],
+                       color="#FFDD00", s=90, marker="s",
+                       edgecolors="black", linewidths=1.5,
+                       label=f"{label_prefix} Home (0,0)")
+            ax.scatter([0], [span], [0],
+                       color="#FFDD00", s=90, marker="s",
+                       edgecolors="black", linewidths=1.5)
+
+            # Start point markers (first profile point reached via lead-in)
             ax.scatter([left[0, 0]], [0], [left[0, 1]],
                        color="#00FF88", s=60, marker="o",
                        edgecolors="white", linewidths=1,
-                       label=f"{label_prefix} Baslangic (orta-alt)")
+                       label=f"{label_prefix} Profil Baslangic (orta-alt)")
             ax.scatter([right[0, 0]], [span], [right[0, 1]],
                        color="#00FF88", s=60, marker="o",
                        edgecolors="white", linewidths=1)
