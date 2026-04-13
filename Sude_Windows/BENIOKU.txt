@@ -1,0 +1,113 @@
+==========================================
+  SUDE - HotWire Foam Cutter v2.0
+  DXF to G-code (Grbl HotWire 6.5 XYZA)
+==========================================
+
+4 eksenli hotwire kopuk kesim makinesi icin
+DXF profillerinden G-code ureten program.
+
+Ozellikler:
+- DXF yukleme (Root + Tip profilleri)
+- Taper projeksiyon (ucgen benzerligi)
+- Bagimsiz Root / Tip X offset
+- Kerf + Tel tolerans telafisi
+- Spar slot otomatik temizleme
+- 3D kesim onizleme
+- Grbl HotWire 6.5 XYZA G-code
+
+==========================================
+  KURULUM (ADIMLAR)
+==========================================
+
+ADIM 1: Python Yukleme
+------------------------
+1. Su adrese git:
+   https://www.python.org/downloads/
+
+2. "Download Python 3.12" (veya daha yeni)
+   butonuna tikla, dosyayi indir.
+
+3. Indirilen dosyaya cift tikla.
+
+4. **COK ONEMLI**: Acilan kurulum penceresinde
+   alttaki "Add Python to PATH" kutusunu
+   ISARETLE! (isaretlemezsen calismaz)
+
+5. "Install Now" butonuna tikla.
+   Bitmesini bekle, "Close" ile kapat.
+
+
+ADIM 2: Sude.exe Olusturma
+---------------------------
+1. Bu klasorde "DERLE.bat" dosyasina
+   cift tikla.
+
+2. Siyah bir pencere acilacak ve otomatik
+   olarak kutuphaneleri yukleyecek
+   (1-2 dakika surer).
+
+3. Ardindan Sude.exe derlenecek
+   (2-3 dakika surer).
+
+4. Bittiginde "dist" klasoru acilacak
+   ve icinde "Sude.exe" olacak.
+
+
+ADIM 3: Programi Calistirma
+----------------------------
+1. dist\Sude.exe dosyasina cift tikla.
+
+2. Program acilacak. Artik Python'a veya
+   DERLE.bat'a gerek yok - Sude.exe tek
+   basina calisir.
+
+3. Sude.exe'yi masaustune veya istedigin
+   yere kopyalayabilirsin.
+
+
+==========================================
+  KULLANIM
+==========================================
+
+1. "Root Profil" > Yukle butonuna tikla,
+   DXF dosyasini sec.
+
+2. Farkli bir tip profili varsa:
+   "Tip Profil" > Yukle butonuna tikla.
+   (Duz kanat ise bos birak)
+
+3. Sag taraftaki parametreleri ayarla:
+   - Feed Rate: kesim hizi
+   - Tel Mesafesi: iki carriage arasi mesafe
+   - Kopuk Genisligi: kesilecek kopugun eni
+   - Sol Bosluk: sol carriage-kopuk arasi
+   - Root/Tip X Offset: profil X konumu
+   - Tel Tolerans: telin erittigi fazla pay
+
+4. "Profil Onizle" ile 2D goruntule.
+   "3D Onizle" ile 3D goruntule.
+
+5. "G-code Uret" ile G-code olustur.
+
+6. "G-code Kaydet (.nc)" ile dosyayi
+   bilgisayara kaydet.
+
+7. .nc dosyasini Grbl HotWire 6.5
+   uygulamasinda ac ve kesim yap.
+
+
+==========================================
+  SORUN OLURSA
+==========================================
+
+- Python kurulumunda PATH isaretlemeyi
+  unuttuysan: Python'u kaldir ve yeniden
+  kur, bu sefer PATH isaretle.
+
+- DERLE.bat hata verirse: bilgisayari
+  yeniden baslat ve tekrar dene.
+
+- Sude.exe acilmiyorsa: antivirus
+  engellemis olabilir, izin ver.
+
+==========================================

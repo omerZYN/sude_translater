@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.manifest
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Local user settings produced at runtime
+.sude_hotwire_settings.json
+
+# Redundant packaged zip (the Sude_Windows/ folder itself is in the repo)
+Sude_Windows.zip
