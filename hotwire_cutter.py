@@ -175,53 +175,75 @@ def normalize_profile(points):
     return points, shift
 
 
+def _resample_by_arc_length(polyline, n):
+    """Sample n points evenly by arc length along an OPEN polyline.
+    Returns an Nx2 array. Endpoint excluded so n points fit cleanly without
+    duplicating the final vertex."""
+    if len(polyline) < 2 or n <= 0:
+        return np.tile(polyline[0], (max(n, 1), 1)) if len(polyline) else np.zeros((n, 2))
+    deltas = np.diff(polyline, axis=0)
+    seg_lens = np.sqrt(np.sum(deltas ** 2, axis=1))
+    cum_lens = np.concatenate([[0.0], np.cumsum(seg_lens)])
+    total_len = float(cum_lens[-1])
+    if total_len < 1e-9:
+        return np.tile(polyline[0], (n, 1))
+    target_lens = np.linspace(0, total_len, n, endpoint=False)
+    x = np.interp(target_lens, cum_lens, polyline[:, 0])
+    y = np.interp(target_lens, cum_lens, polyline[:, 1])
+    return np.column_stack([x, y])
+
+
 def interpolate_profile(points, num_points):
-    """Chord-fraction resampling (taper matching).
-    ONLY used when a Tip DXF is also loaded, because root and tip need equal
-    sample counts at matching chord fractions so the wire can link them.
-    For straight wings the raw DXF points are used as-is (see _process_profiles).
+    """Split-at-TE arc-length resampling of a closed profile.
 
-    This function preserves the shape of the upper/lower surfaces directly from
-    the DXF — it no longer performs any envelope cleaning that might hide spar
-    slots or other features."""
+    Unlike plain chord-fraction interpolation (which fails for vertical
+    edges) or plain arc-length (which doesn't align LE/TE features between
+    different profiles), this hybrid:
+      1. Splits the profile at its rightmost vertex (TE = argmax X).
+      2. Resamples the lower surface (LE -> TE) with n_lower arc-length
+         evenly-spaced points.
+      3. Resamples the upper surface (TE -> LE) with n_upper arc-length
+         evenly-spaced points.
+      4. Concatenates the two halves.
 
-    # Find TE (max X) to split surfaces
+    Result: index 0 is LE, index n_lower is TE, and both halves have points
+    distributed evenly by arc length within their surface. For any two
+    profiles in the same winding (CCW) this guarantees root[i] and tip[i]
+    correspond to the same feature (LE at 0, TE at n_lower, and surface
+    fractions in between), so the wire links them consistently even when
+    the profiles have vertical edges or very different aspect ratios.
+
+    EXPECTS CCW winding (call _ensure_ccw first).
+    """
+    if np.allclose(points[0], points[-1], atol=1e-6):
+        points = points[:-1]
+
     te_idx = int(np.argmax(points[:, 0]))
-    chord = float(points[te_idx, 0])
-    if chord < 1e-6:
-        chord = 1.0
 
-    # Assume CCW normalized: lower surface = LE(0) -> TE, upper = TE -> LE(end)
-    lower = points[:te_idx + 1]
-    upper = points[te_idx:]
+    # CCW order: LE(0) -> ...lower... -> TE(te_idx) -> ...upper... -> LE
+    lower = points[:te_idx + 1]                       # LE ... TE
+    upper = np.vstack([points[te_idx:], points[0:1]]) # TE ... LE (closed back)
 
-    # Half points per surface
     n_lower = num_points // 2
     n_upper = num_points - n_lower
 
-    # Target chord-fraction X positions
-    lower_x_targets = np.linspace(0, chord, n_lower, endpoint=True)
-    upper_x_targets = np.linspace(chord, 0, n_upper, endpoint=False)
-
-    # Lower surface: X must be monotonically non-decreasing for np.interp.
-    # If the DXF path dips backward, sort by X to make the interpolation stable
-    # (we still keep every original Y value, just index them by X).
-    lower_sorted = lower[np.argsort(lower[:, 0], kind="stable")]
-    lower_pts = np.column_stack([
-        lower_x_targets,
-        np.interp(lower_x_targets, lower_sorted[:, 0], lower_sorted[:, 1]),
-    ])
-
-    # Upper surface: flip so X increases for interpolation, then flip result back
-    upper_flip = upper[::-1]
-    upper_flip_sorted = upper_flip[np.argsort(upper_flip[:, 0], kind="stable")]
-    upper_pts = np.column_stack([
-        upper_x_targets,
-        np.interp(upper_x_targets[::-1], upper_flip_sorted[:, 0],
-                  upper_flip_sorted[:, 1])[::-1],
-    ])
+    lower_pts = _resample_by_arc_length(lower, n_lower)
+    upper_pts = _resample_by_arc_length(upper, n_upper)
 
     return np.vstack([lower_pts, upper_pts])
+
+
+def _ensure_ccw(points):
+    """Return a copy of the points in counter-clockwise order.
+    Reverses the array if the polygon's signed area is negative (CW)."""
+    xs = points[:, 0]
+    ys = points[:, 1]
+    signed_area = 0.5 * float(
+        np.sum(xs * np.roll(ys, -1) - np.roll(xs, -1) * ys)
+    )
+    if signed_area < 0:  # CW -> reverse to get CCW
+        return points[::-1].copy()
+    return points
 
 
 def _orient_cw(points):
@@ -1260,11 +1282,18 @@ class HotWireCutterApp:
         """Prepare root and tip profiles for cutting.
 
         Steps:
-          1. normalize_profile (LE at X=0, taban at Y=0)
-          2. Straight wing: use raw normalized points (DXF fidelity — no resampling).
-             Tapered wing: chord-fraction resample to num_points so root/tip link.
-          3. _orient_cw — deterministic clockwise winding
-          4. _roll_to_mid_lower — start at mid-chord on the lower surface.
+          1. normalize_profile (LE at X=0, taban at Y=0, array starts at LE)
+          2. _ensure_ccw: force both profiles into counter-clockwise order so
+             that arc-length resampling lines up root[i] with tip[i]. Without
+             this, a DXF drawn CW and another drawn CCW would produce mirror
+             indexed points and the taper projection would amplify the mismatch
+             into huge Y jumps during the cut.
+          3. Straight wing: use raw normalized points (DXF fidelity — no resampling).
+             Tapered wing: arc-length resample to num_points. Arc-length (not
+             chord-fraction) correctly samples vertical edges, so fuselage /
+             body cross-sections with flat sides work.
+          4. _orient_cw — reverse both simultaneously so cut direction is CW.
+          5. _roll_to_mid_lower — start at mid-chord on the lower surface.
              Root's start index is also applied to the tip so the wire points
              correspond 1:1 across the span.
         """
@@ -1272,11 +1301,15 @@ class HotWireCutterApp:
 
         root_raw = self.root_profile.copy()
         root_norm, _ = normalize_profile(root_raw)
+        root_norm = _ensure_ccw(root_norm)
 
         if self.tip_profile is not None:
             tip_raw = self.tip_profile.copy()
             tip_norm, _ = normalize_profile(tip_raw)
-            # Tapered wing: resample both at matching chord fractions.
+            tip_norm = _ensure_ccw(tip_norm)
+            # Tapered wing: arc-length resample both (same CCW winding + same
+            # LE-anchored start -> root[i] and tip[i] are at matching
+            # perimeter fractions).
             root_prepared = interpolate_profile(root_norm, num_points)
             tip_prepared = interpolate_profile(tip_norm, num_points)
         else:
@@ -1284,7 +1317,7 @@ class HotWireCutterApp:
             root_prepared = root_norm
             tip_prepared = root_norm.copy()
 
-        # Deterministic clockwise winding
+        # Reverse both (still in lock-step) so the cut direction is clockwise
         root_prepared = _orient_cw(root_prepared)
         tip_prepared = _orient_cw(tip_prepared)
 
@@ -1300,16 +1333,18 @@ class HotWireCutterApp:
         return root_prepared, tip_prepared
 
     def _process_spar_profiles(self, params):
-        """Prepare spar profiles with the same CW/mid-lower convention as
+        """Prepare spar profiles with the same CCW-interp/CW-cut convention as
         the main profile, so the spar G-code follows the same start pattern."""
         num_points = params["num_points"]
         if self.spar_root_profile is None:
             return None, None
 
         spar_root_norm, _ = normalize_profile(self.spar_root_profile.copy())
+        spar_root_norm = _ensure_ccw(spar_root_norm)
 
         if self.spar_tip_profile is not None:
             spar_tip_norm, _ = normalize_profile(self.spar_tip_profile.copy())
+            spar_tip_norm = _ensure_ccw(spar_tip_norm)
             spar_root_prep = interpolate_profile(spar_root_norm, num_points)
             spar_tip_prep = interpolate_profile(spar_tip_norm, num_points)
         else:
