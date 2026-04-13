@@ -373,23 +373,25 @@ def build_machine_toolpath(root_pts, tip_pts, params):
         root = apply_kerf_offset(root, total_offset)
         tip = apply_kerf_offset(tip, total_offset)
 
-    # Chord lengths (post-kerf, pre X offset / projection)
+    # Chord lengths (post-kerf)
     root_chord = float(np.max(root[:, 0]) - np.min(root[:, 0]))
     tip_chord = float(np.max(tip[:, 0]) - np.min(tip[:, 0]))
 
-    # Independent X offsets
-    root[:, 0] += root_x_offset
-    tip[:, 0] += tip_x_offset
-
-    # Taper projection (triangle similarity)
+    # Taper projection in the local (profile) frame — NO offsets applied yet.
     left, right = apply_taper_projection(
         root, tip, span, foam_width, foam_left_offset
     )
-
-    # Apply vertical offsets at the carriage level
     left = left.copy()
     right = right.copy()
+
+    # Option B: offsets translate each carriage path as a whole unit. After
+    # normalization the profile's bounding-box lower-left corner is at (0,0)
+    # locally, so shifting by the offsets places that corner at the user-
+    # specified (offset_X, offset_Y). The profile stays entirely in positive
+    # territory when both offsets are non-negative.
+    left[:, 0] += root_x_offset
     left[:, 1] += root_y_offset
+    right[:, 0] += tip_x_offset
     right[:, 1] += tip_z_offset
 
     return {
@@ -458,9 +460,15 @@ def generate_gcode(root_pts, tip_pts, params):
     lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
     lines.append("()")
 
-    # Lead-in cut: straight G01 from home to the first profile point (CW start).
-    # Hotwire is always hot so this is a regular feed-rate move.
-    lines.append("(Lead-in: (0,0) -> profil orta-alt baslangic noktasi)")
+    # L-shaped lead-in:
+    #   Segment 1: X / A move only   (Y=Z=0 stays)
+    #   Segment 2: Y / Z move up to the first cut point
+    # Both carriages move simultaneously on each G01, so each segment takes
+    # one line of G-code.
+    lines.append("(Lead-in L-sekli: once X/A ekseninde, sonra Y/Z ekseninde)")
+    lines.append(
+        f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}"
+    )
     lines.append(
         f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
     )
@@ -481,8 +489,13 @@ def generate_gcode(root_pts, tip_pts, params):
     )
     lines.append("()")
 
-    # Lead-out: retrace the same line back to home (0, 0)
-    lines.append("(Lead-out: profil baslangic noktasi -> (0,0))")
+    # L-shaped lead-out (reverse of lead-in):
+    #   Segment 1: Y / Z back to 0 (keeping X / A at start)
+    #   Segment 2: X / A back to 0
+    lines.append("(Lead-out L-sekli: once Y/Z 0'a, sonra X/A 0'a)")
+    lines.append(
+        f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}"
+    )
     lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Kesim Bitti)")
 
@@ -507,7 +520,8 @@ def generate_spar_gcode(root_pts, tip_pts, params):
     lines.append("(=== SPAR DELIGI KESIMI ===)")
     lines.append("(Spar baslangic - Motor home)")
     lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
-    lines.append("(Spar Lead-in: (0,0) -> spar orta-alt)")
+    lines.append("(Spar Lead-in L-sekli: once X/A, sonra Y/Z)")
+    lines.append(f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}")
     lines.append(
         f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
     )
@@ -527,7 +541,8 @@ def generate_spar_gcode(root_pts, tip_pts, params):
     )
     lines.append("()")
 
-    lines.append("(Spar Lead-out: spar baslangic -> (0,0))")
+    lines.append("(Spar Lead-out L-sekli: once Y/Z 0, sonra X/A 0)")
+    lines.append(f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}")
     lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Spar Kesim Bitti)")
 
@@ -633,25 +648,26 @@ PARAM_TOOLTIPS = {
     ),
     "root_x_offset": (
         "Root (sol carriage) X offset (mm).\n\n"
-        "Root profilinin X ekseninde kesim baslangic otelemesi. Sweep "
-        "(ok aci) vermek veya kesim bolgesini hareket alani icinde kaydirmak "
-        "icin kullanilir. 0 -> profilin hucum kenari motor 0 hizasinda."
+        "Profilin sol carriage'taki sol-alt kose (BB) X konumu. "
+        "Lead-in L-seklindedir: once X ekseninde bu degere kadar gider, "
+        "sonra Y ekseninde Y offset'e kadar. Profil bu noktadan yukari/saga "
+        "dogru uzar ve tamamen pozitif bolgede kalir."
     ),
     "tip_x_offset": (
         "Tip (sag carriage) A offset (mm).\n\n"
-        "Tip profilinin A ekseninde (sag yatay) kesim baslangic otelemesi. "
-        "Root'unkinden farkli bir deger verirsen taper + sweep kombinasyonu "
-        "elde edilir."
+        "Sag carriage (A ekseni) icin BB kose X konumu. Sol ile ayni deger "
+        "-> straight wing; farkli -> sweep/yellene."
     ),
     "root_y_offset": (
         "Root (sol carriage) Y offset (mm).\n\n"
-        "Sol carriage icin dikey kesim baslangic otelemesi. 0 -> profilin "
-        "tabani motor 0 seviyesinde. Buraya girilen deger kadar profilin "
-        "alti motor 0'in uzerine cikar (kopuk altina mesafe birakmak icin)."
+        "Profilin sol carriage'taki sol-alt kose (BB) Y konumu. "
+        "Lead-in L'nin ikinci (dikey) ayagi bu yuksekligine cikar, sonra "
+        "kesim baslar. 0 -> profil tabani motor 0 hizasinda. 20 -> profil "
+        "tabani motor 0'dan 20mm yukarida."
     ),
     "tip_z_offset": (
         "Tip (sag carriage) Z offset (mm).\n\n"
-        "Sag carriage icin dikey kesim baslangic otelemesi. Sol carriage'dan "
+        "Sag carriage (Z ekseni) icin BB kose Y konumu. Sol carriage'dan "
         "bagimsizdir; iki carriage arasinda yukseklik farki verebilirsin."
     ),
     "kerf": (
@@ -1377,14 +1393,15 @@ class HotWireCutterApp:
                 spar_gcode = generate_spar_gcode(
                     spar_root.copy(), spar_tip.copy(), params
                 )
-                # Drop the main cut's final lead-out + "Kesim Bitti" lines so
-                # the spar section can pick up from the last profile point,
-                # then append the spar block (which starts with its own
-                # home + lead-in).
+                # Drop the main cut's L-shaped lead-out + "Kesim Bitti" lines
+                # so the spar section can start fresh from home (it emits its
+                # own home + lead-in block). Main lead-out is 4 lines:
+                #   (Lead-out L-sekli ...)  <- comment
+                #   G01 ... Y0 Z0 ...        <- Y/Z to 0
+                #   G01 X0 Y0 Z0 A0          <- X/A to 0
+                #   (Kesim Bitti)            <- comment
                 main_lines = gcode.split("\n")
-                # Cut the trailing 2 lines: "(Lead-out ...)" and the G01 home
-                # move, and "(Kesim Bitti)" comment — 3 total to strip.
-                gcode = "\n".join(main_lines[:-3]) + "\n" + spar_gcode
+                gcode = "\n".join(main_lines[:-4]) + "\n" + spar_gcode
 
             self.generated_gcode = gcode
 
@@ -1437,11 +1454,14 @@ class HotWireCutterApp:
                     color=cut_color_right, linewidth=2,
                     label=f"{label_prefix} Sag Carriage (A,Z)")
 
-            # Lead-in line: (0,0) -> first profile point for each carriage
-            ax.plot([0, left[0, 0]], [0, 0], [0, left[0, 1]],
+            # L-shaped lead-in for each carriage:
+            #   (0, 0) -> (start_x, 0) -> (start_x, start_y)
+            lx0 = left[0, 0]; ly0 = left[0, 1]
+            ax.plot([0, lx0, lx0], [0, 0, 0], [0, 0, ly0],
                     color=approach_color, linewidth=1.8, linestyle="--",
-                    label=f"{label_prefix} Lead-in / Lead-out (0,0)")
-            ax.plot([0, right[0, 0]], [span, span], [0, right[0, 1]],
+                    label=f"{label_prefix} Lead-in / Lead-out (L)")
+            rx0 = right[0, 0]; ry0 = right[0, 1]
+            ax.plot([0, rx0, rx0], [span, span, span], [0, 0, ry0],
                     color=approach_color, linewidth=1.8, linestyle="--")
 
             # (0, 0) home marker — where the cut literally starts
