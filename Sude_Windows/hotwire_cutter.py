@@ -1395,7 +1395,8 @@ class HotWireCutterApp:
         must click Onayla to produce the G-code — Iptal just closes."""
         win = tk.Toplevel(self.root)
         win.title("Sude - Toolpath Onayi")
-        win.geometry("1000x800")
+        win.geometry("1000x720")
+        win.minsize(800, 560)
         win.transient(self.root)
 
         fig = plt.Figure(figsize=(11, 8), facecolor="#2b2b2b")
@@ -1494,33 +1495,10 @@ class HotWireCutterApp:
         ax.legend(loc="upper left", fontsize=8, facecolor="#333333",
                   edgecolor="#555555", labelcolor="white")
 
-        canvas_widget = FigureCanvasTkAgg(fig, master=win)
-        canvas_widget.draw()
-        canvas_widget.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
-        toolbar_frame = ttk.Frame(win)
-        toolbar_frame.pack(fill=tk.X)
-        toolbar = NavigationToolbar2Tk(canvas_widget, toolbar_frame)
-        toolbar.update()
-
-        # Info + buttons
-        bottom = ttk.Frame(win, padding=8)
-        bottom.pack(fill=tk.X)
-
-        info_text = (
-            f"Ana kesim: {len(main_tp['left'])} nokta  |  "
-            f"Root chord: {main_tp['root_chord']:.1f}mm  |  "
-            f"Tip chord: {main_tp['tip_chord']:.1f}mm  |  "
-            f"Feed: {main_tp['feed']} mm/min  |  "
-            f"Kerf+Tol: {main_tp['total_offset']:.2f}mm"
-        )
-        if spar_tp is not None:
-            info_text += f"\nSpar: {len(spar_tp['left'])} nokta"
-        ttk.Label(bottom, text=info_text, foreground="#333").pack(
-            side=tk.LEFT, padx=5
-        )
-
+        # IMPORTANT: Pack the button row FIRST at side=BOTTOM so it reserves
+        # its strip of space before the expanding 3D canvas claims everything.
+        # Tk pack works outside-in: later elements fill what the earlier ones
+        # left over, so the canvas must be packed LAST with expand=True.
         def _confirm():
             win.destroy()
             self._finalize_gcode(root_interp, tip_interp,
@@ -1530,13 +1508,53 @@ class HotWireCutterApp:
             win.destroy()
             self.status_var.set("Toolpath iptal edildi.")
 
-        ttk.Button(bottom, text="Iptal", command=_cancel).pack(
-            side=tk.RIGHT, padx=3
-        )
-        ttk.Button(bottom, text="Onayla ve G-code Uret",
-                   command=_confirm).pack(side=tk.RIGHT, padx=3)
+        # Bottom button bar — tall, bold, always visible
+        bottom = ttk.Frame(win, padding=10)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Cancel on window close as well
+        info_text = (
+            f"Ana kesim: {len(main_tp['left'])} nokta  |  "
+            f"Root chord: {main_tp['root_chord']:.1f}mm  |  "
+            f"Tip chord: {main_tp['tip_chord']:.1f}mm  |  "
+            f"Feed: {main_tp['feed']} mm/min  |  "
+            f"Kerf+Tol: {main_tp['total_offset']:.2f}mm"
+        )
+        if spar_tp is not None:
+            info_text += f"  |  Spar: {len(spar_tp['left'])} nokta"
+        ttk.Label(bottom, text=info_text, foreground="#333").pack(
+            side=tk.LEFT, padx=5
+        )
+
+        # Make the confirm button visually prominent (tk.Button supports
+        # background color, ttk.Button does not on macOS)
+        tk.Button(
+            bottom, text="  Onayla ve G-code Uret  ", command=_confirm,
+            bg="#00A86B", fg="white", activebackground="#008c5a",
+            activeforeground="white",
+            font=("Arial", 11, "bold"), relief=tk.RAISED, bd=2,
+            cursor="hand2", padx=8, pady=4,
+        ).pack(side=tk.RIGHT, padx=4)
+        tk.Button(
+            bottom, text="  Iptal  ", command=_cancel,
+            bg="#C83232", fg="white", activebackground="#a02020",
+            activeforeground="white",
+            font=("Arial", 11, "bold"), relief=tk.RAISED, bd=2,
+            cursor="hand2", padx=8, pady=4,
+        ).pack(side=tk.RIGHT, padx=4)
+
+        # Matplotlib navigation toolbar — packs above the button bar
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        toolbar_frame = ttk.Frame(win)
+        toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas_widget = FigureCanvasTkAgg(fig, master=win)
+        toolbar = NavigationToolbar2Tk(canvas_widget, toolbar_frame)
+        toolbar.update()
+
+        # 3D canvas last — fills whatever vertical space the bottom bars left
+        canvas_widget.draw()
+        canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # Cancel on window-close as well
         win.protocol("WM_DELETE_WINDOW", _cancel)
 
     def _save(self):
