@@ -154,14 +154,24 @@ def extract_profile_from_dxf(filepath):
 
 def normalize_profile(points):
     """Normalize profile so that LE is at X=0 and the profile bottom (min Y)
-    rests on the Y=0 plane. This makes the default zero reference the motor
-    side: hucum kenari X=0'da, profil tabani Y=0'da."""
+    rests on the Y=0 plane.
+
+    The "LE" anchor is the (min X, min Y) corner — i.e. among all points with
+    the minimum X, we pick the one with the minimum Y. This makes the anchor
+    DETERMINISTIC for profiles with a vertical LE edge (like body/fuselage
+    sections): root and tip both start at their "bottom-of-LE" corner, which
+    is the same feature regardless of DXF vertex order."""
     # Remove duplicate closing point if present
     if np.allclose(points[0], points[-1], atol=0.01):
         points = points[:-1]
 
-    # Find leading edge (minimum X = most forward point)
-    le_idx = np.argmin(points[:, 0])
+    # Canonical LE: min X, tie-break with min Y. This ensures root and tip
+    # both start at the same feature even when LE is a vertical edge.
+    x_min = float(points[:, 0].min())
+    mask = points[:, 0] <= x_min + 1e-6
+    candidate_idx = np.where(mask)[0]
+    candidate_y = points[candidate_idx, 1]
+    le_idx = int(candidate_idx[int(np.argmin(candidate_y))])
 
     # Rotate array so leading edge is first
     points = np.roll(points, -le_idx, axis=0)
@@ -193,44 +203,100 @@ def _resample_by_arc_length(polyline, n):
     return np.column_stack([x, y])
 
 
-def interpolate_profile(points, num_points):
-    """Split-at-TE arc-length resampling of a closed profile.
-
-    Unlike plain chord-fraction interpolation (which fails for vertical
-    edges) or plain arc-length (which doesn't align LE/TE features between
-    different profiles), this hybrid:
-      1. Splits the profile at its rightmost vertex (TE = argmax X).
-      2. Resamples the lower surface (LE -> TE) with n_lower arc-length
-         evenly-spaced points.
-      3. Resamples the upper surface (TE -> LE) with n_upper arc-length
-         evenly-spaced points.
-      4. Concatenates the two halves.
-
-    Result: index 0 is LE, index n_lower is TE, and both halves have points
-    distributed evenly by arc length within their surface. For any two
-    profiles in the same winding (CCW) this guarantees root[i] and tip[i]
-    correspond to the same feature (LE at 0, TE at n_lower, and surface
-    fractions in between), so the wire links them consistently even when
-    the profiles have vertical edges or very different aspect ratios.
-
-    EXPECTS CCW winding (call _ensure_ccw first).
+def _find_canonical_extremum(points, axis, direction, tie_axis, tie_direction):
+    """Find an extremum index with a tie-break on another axis.
+    axis/tie_axis: 0 for X, 1 for Y. direction/tie_direction: 'min' or 'max'.
+    Example: LE as (min X, tie min Y) picks the lowest-Y point among those
+    with the minimum X, which for a vertical LE edge is its bottom endpoint.
     """
+    vals = points[:, axis]
+    ext = vals.min() if direction == "min" else vals.max()
+    mask = np.isclose(vals, ext, atol=1e-4)
+    candidates = np.where(mask)[0]
+    tie_vals = points[candidates, tie_axis]
+    if tie_direction == "min":
+        return int(candidates[int(np.argmin(tie_vals))])
+    return int(candidates[int(np.argmax(tie_vals))])
+
+
+def interpolate_profile(points, num_points):
+    """Four-extrema split arc-length resampling.
+
+    Splits the profile at four canonical corners and resamples each segment
+    independently by arc length with MATCHING point counts between segments:
+        LE  = (min X, tie min Y)   — bottom of the leading edge
+        BOT = (min Y, tie max X)   — far-right end of the bottom
+        TE  = (max X, tie max Y)   — top of the trailing edge
+        TOP = (max Y, tie min X)   — far-left end of the top
+
+    Why: for two profiles that share a topology but differ in dimensions
+    (e.g. a short fuselage root and a tall fuselage tip), a single-segment
+    arc-length resampling gives different per-feature point densities —
+    root[i] on the short vertical edge matches tip[i] somewhere else on the
+    longer vertical edge and the wire slants when it should stay straight.
+    By splitting at the 4 canonical extrema and forcing EQUAL point counts
+    per quadrant, root[i] and tip[i] always fall at the same fraction of
+    the same edge, so vertical edges stay vertical across the span.
+
+    EXPECTS CCW winding with points[0] already at LE (call normalize_profile
+    + _ensure_ccw first)."""
     if np.allclose(points[0], points[-1], atol=1e-6):
         points = points[:-1]
+    n = len(points)
+    if n < 4:
+        return _resample_by_arc_length(
+            np.vstack([points, points[:1]]), num_points
+        )
 
-    te_idx = int(np.argmax(points[:, 0]))
+    # Four canonical extrema
+    le_idx = _find_canonical_extremum(points, 0, "min", 1, "min")
+    bot_idx = _find_canonical_extremum(points, 1, "min", 0, "max")
+    te_idx = _find_canonical_extremum(points, 0, "max", 1, "max")
+    top_idx = _find_canonical_extremum(points, 1, "max", 0, "min")
 
-    # CCW order: LE(0) -> ...lower... -> TE(te_idx) -> ...upper... -> LE
-    lower = points[:te_idx + 1]                       # LE ... TE
-    upper = np.vstack([points[te_idx:], points[0:1]]) # TE ... LE (closed back)
+    # Build the ordered list of split indices in CCW traversal order.
+    # For CCW starting at LE, the expected order is LE -> BOT -> TE -> TOP.
+    # If any two extrema coincide (e.g. BOT == LE for a symmetric airfoil),
+    # we drop the duplicate so we don't produce a zero-length segment.
+    ordered = []
+    for idx in [le_idx, bot_idx, te_idx, top_idx]:
+        if idx not in ordered:
+            ordered.append(idx)
 
-    n_lower = num_points // 2
-    n_upper = num_points - n_lower
+    # Roll the array so LE is at index 0 and translate the other extrema.
+    if le_idx != 0:
+        points = np.roll(points, -le_idx, axis=0)
+        ordered = [(i - le_idx) % n for i in ordered]
+    # LE is now at 0; sort the remaining extrema in CCW order (ascending idx)
+    ordered = [0] + sorted(i for i in ordered if i != 0)
 
-    lower_pts = _resample_by_arc_length(lower, n_lower)
-    upper_pts = _resample_by_arc_length(upper, n_upper)
+    num_seg = len(ordered)
+    if num_seg < 2:
+        return _resample_by_arc_length(
+            np.vstack([points, points[:1]]), num_points
+        )
 
-    return np.vstack([lower_pts, upper_pts])
+    # Distribute points EQUALLY across segments so the same feature on
+    # different profiles lands at the same index regardless of edge length.
+    base = num_points // num_seg
+    counts = [base] * num_seg
+    remainder = num_points - base * num_seg
+    for i in range(remainder):
+        counts[i] += 1
+
+    # Resample each segment (open polyline from extrema[i] to extrema[i+1])
+    result = []
+    for seg_i, (start_idx, count) in enumerate(zip(ordered, counts)):
+        end_idx = ordered[(seg_i + 1) % num_seg]
+        if end_idx > start_idx:
+            segment = points[start_idx:end_idx + 1]
+        else:
+            # wraps past the end back to the first extremum
+            segment = np.vstack([points[start_idx:], points[:end_idx + 1]])
+        seg_pts = _resample_by_arc_length(segment, count)
+        result.append(seg_pts)
+
+    return np.vstack(result)
 
 
 def _ensure_ccw(points):
@@ -419,6 +485,22 @@ def build_machine_toolpath(root_pts, tip_pts, params):
     # taper extrapolation because the wire doesn't "tilt" in Y due to offsets.
     left[:, 1] += root_y_offset
     right[:, 1] += tip_z_offset
+
+    # Auto-shift to non-negative machine coordinates.
+    # X and A are shifted TOGETHER by the same amount so sweep/TE-alignment
+    # geometry is preserved (relative X positions unchanged). Y and Z are
+    # shifted INDEPENDENTLY because they're separate vertical axes and
+    # shifting one wouldn't affect the other's cut geometry.
+    xa_min = min(float(left[:, 0].min()), float(right[:, 0].min()))
+    if xa_min < 0:
+        left[:, 0] -= xa_min
+        right[:, 0] -= xa_min
+    y_min = float(left[:, 1].min())
+    if y_min < 0:
+        left[:, 1] -= y_min
+    z_min = float(right[:, 1].min())
+    if z_min < 0:
+        right[:, 1] -= z_min
 
     return {
         "left": left,
