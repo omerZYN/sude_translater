@@ -331,6 +331,12 @@ def _roll_to_mid_lower(points):
     """Roll the point array so that the starting point (index 0) is the
     point on the LOWER surface closest to mid-chord (X = chord/2).
 
+    Tiebreak: when multiple points are equally close to mid-chord (typical
+    for a sparse rectangular profile where only the two edge endpoints land
+    on the lower surface), prefer the one with the smaller X. That puts the
+    cut start near the LE side of the bottom edge, which keeps the lead-in
+    line from home (0,0) short and close to the profile's left edge.
+
     Expects a CW-oriented profile produced by _orient_cw where the upper
     surface runs LE -> TE (indices 0..te_idx) and the lower surface runs
     TE -> LE (indices te_idx..n-1). Returns (rolled_points, start_idx)."""
@@ -344,7 +350,14 @@ def _roll_to_mid_lower(points):
     tail = points[te_idx:]
     if len(tail) == 0:
         return points, 0
-    rel = int(np.argmin(np.abs(tail[:, 0] - x_mid)))
+    diffs = np.abs(tail[:, 0] - x_mid)
+    min_diff = float(diffs.min())
+    # Candidates are points within a tiny tolerance of min_diff
+    cand_mask = diffs <= min_diff + 1e-6
+    cand_indices = np.where(cand_mask)[0]
+    cand_xs = tail[cand_indices, 0]
+    # Among ties, pick smallest X (closer to LE side)
+    rel = int(cand_indices[int(np.argmin(cand_xs))])
     start_idx = te_idx + rel
     rolled = np.roll(points, -start_idx, axis=0)
     return rolled, start_idx
@@ -1370,21 +1383,24 @@ class HotWireCutterApp:
     def _process_profiles(self, params):
         """Prepare root and tip profiles for cutting.
 
-        Steps:
-          1. normalize_profile (LE at X=0, taban at Y=0, array starts at LE)
-          2. _ensure_ccw: force both profiles into counter-clockwise order so
-             that arc-length resampling lines up root[i] with tip[i]. Without
-             this, a DXF drawn CW and another drawn CCW would produce mirror
-             indexed points and the taper projection would amplify the mismatch
-             into huge Y jumps during the cut.
-          3. Straight wing: use raw normalized points (DXF fidelity — no resampling).
-             Tapered wing: arc-length resample to num_points. Arc-length (not
-             chord-fraction) correctly samples vertical edges, so fuselage /
-             body cross-sections with flat sides work.
-          4. _orient_cw — reverse both simultaneously so cut direction is CW.
-          5. _roll_to_mid_lower — start at mid-chord on the lower surface.
-             Root's start index is also applied to the tip so the wire points
-             correspond 1:1 across the span.
+        Path selection (in order of preference, picks the first that fits):
+
+          A) Straight wing (no tip DXF): use raw normalized root points,
+             duplicated to tip. Maximum DXF fidelity.
+
+          B) Tapered wing where root and tip have the SAME vertex count:
+             use raw DXF vertices directly with index-by-index pairing.
+             No interpolation, so corners stay exactly where the DXF placed
+             them and straight edges stay perfectly straight. This is the
+             best result when both profiles share topology (drawn in the
+             same CAD style).
+
+          C) Tapered wing with different vertex counts: 4-extrema split
+             arc-length resampling to num_points on each side, with feature
+             alignment at LE / BOT / TE / TOP corners.
+
+        All paths apply: normalize -> _ensure_ccw -> (case-specific) ->
+        _orient_cw -> _roll_to_mid_lower (with shared start index).
         """
         num_points = params["num_points"]
 
@@ -1392,19 +1408,27 @@ class HotWireCutterApp:
         root_norm, _ = normalize_profile(root_raw)
         root_norm = _ensure_ccw(root_norm)
 
-        if self.tip_profile is not None:
+        if self.tip_profile is None:
+            # Path A: straight wing, raw points duplicated
+            root_prepared = root_norm
+            tip_prepared = root_norm.copy()
+        else:
             tip_raw = self.tip_profile.copy()
             tip_norm, _ = normalize_profile(tip_raw)
             tip_norm = _ensure_ccw(tip_norm)
-            # Tapered wing: arc-length resample both (same CCW winding + same
-            # LE-anchored start -> root[i] and tip[i] are at matching
-            # perimeter fractions).
-            root_prepared = interpolate_profile(root_norm, num_points)
-            tip_prepared = interpolate_profile(tip_norm, num_points)
-        else:
-            # Straight wing: use raw normalized points exactly.
-            root_prepared = root_norm
-            tip_prepared = root_norm.copy()
+
+            if len(root_norm) == len(tip_norm):
+                # Path B: same vertex count -> direct DXF vertex pairing.
+                # Both arrays already start at the canonical (min X, min Y)
+                # anchor after normalize, so root[i] and tip[i] correspond
+                # to the same vertex in each profile's CCW ordering.
+                root_prepared = root_norm
+                tip_prepared = tip_norm
+            else:
+                # Path C: different vertex counts -> 4-extrema arc-length
+                # resampling for feature alignment.
+                root_prepared = interpolate_profile(root_norm, num_points)
+                tip_prepared = interpolate_profile(tip_norm, num_points)
 
         # Reverse both (still in lock-step) so the cut direction is clockwise
         root_prepared = _orient_cw(root_prepared)
