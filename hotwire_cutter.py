@@ -568,14 +568,17 @@ def generate_gcode(root_pts, tip_pts, params):
     lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
     lines.append("()")
 
-    # L-shaped lead-in:
-    #   Segment 1: X / A move only   (Y=Z=0 stays)
-    #   Segment 2: Y / Z move up to the first cut point
-    # Both carriages move simultaneously on each G01, so each segment takes
-    # one line of G-code.
-    lines.append("(Lead-in L-sekli: once X/A ekseninde, sonra Y/Z ekseninde)")
+    # L-shaped lead-in (vertical-first, horizontal-second):
+    #   Segment 1: Y / Z move up to start (X / A stay at 0)
+    #   Segment 2: X / A move to start (Y / Z stay)
+    # Why this order: the horizontal segment ends up at Y = start_y, which
+    # coincides with the profile's bottom edge — visually merging with the
+    # cut path instead of leaving a stub at the middle of the bottom. The
+    # remaining vertical segment lives at X = 0 (the left edge of the plot)
+    # where it's outside the profile's footprint.
+    lines.append("(Lead-in L-sekli: once Y/Z ekseninde, sonra X/A ekseninde)")
     lines.append(
-        f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}"
+        f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}"
     )
     lines.append(
         f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
@@ -598,11 +601,11 @@ def generate_gcode(root_pts, tip_pts, params):
     lines.append("()")
 
     # L-shaped lead-out (reverse of lead-in):
-    #   Segment 1: Y / Z back to 0 (keeping X / A at start)
-    #   Segment 2: X / A back to 0
-    lines.append("(Lead-out L-sekli: once Y/Z 0'a, sonra X/A 0'a)")
+    #   Segment 1: X / A back to 0 (keeping Y / Z at start)
+    #   Segment 2: Y / Z back to 0
+    lines.append("(Lead-out L-sekli: once X/A 0'a, sonra Y/Z 0'a)")
     lines.append(
-        f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}"
+        f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}"
     )
     lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Kesim Bitti)")
@@ -628,8 +631,8 @@ def generate_spar_gcode(root_pts, tip_pts, params):
     lines.append("(=== SPAR DELIGI KESIMI ===)")
     lines.append("(Spar baslangic - Motor home)")
     lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
-    lines.append("(Spar Lead-in L-sekli: once X/A, sonra Y/Z)")
-    lines.append(f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}")
+    lines.append("(Spar Lead-in L-sekli: once Y/Z, sonra X/A)")
+    lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
     lines.append(
         f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}"
     )
@@ -649,8 +652,8 @@ def generate_spar_gcode(root_pts, tip_pts, params):
     )
     lines.append("()")
 
-    lines.append("(Spar Lead-out L-sekli: once Y/Z 0, sonra X/A 0)")
-    lines.append(f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}")
+    lines.append("(Spar Lead-out L-sekli: once X/A 0, sonra Y/Z 0)")
+    lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
     lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Spar Kesim Bitti)")
 
@@ -1575,14 +1578,16 @@ class HotWireCutterApp:
                     color=cut_color_right, linewidth=2,
                     label=f"{label_prefix} Sag Carriage (A,Z)")
 
-            # L-shaped lead-in for each carriage:
-            #   (0, 0) -> (start_x, 0) -> (start_x, start_y)
+            # L-shaped lead-in for each carriage (Y first, X second):
+            #   (0, 0) -> (0, start_y) -> (start_x, start_y)
+            # Vertical leg lives on X=0 (plot edge), horizontal leg merges
+            # with the profile's bottom — no stub at mid-chord.
             lx0 = left[0, 0]; ly0 = left[0, 1]
-            ax.plot([0, lx0, lx0], [0, 0, 0], [0, 0, ly0],
+            ax.plot([0, 0, lx0], [0, 0, 0], [0, ly0, ly0],
                     color=approach_color, linewidth=1.8, linestyle="--",
                     label=f"{label_prefix} Lead-in / Lead-out (L)")
             rx0 = right[0, 0]; ry0 = right[0, 1]
-            ax.plot([0, rx0, rx0], [span, span, span], [0, 0, ry0],
+            ax.plot([0, 0, rx0], [span, span, span], [0, ry0, ry0],
                     color=approach_color, linewidth=1.8, linestyle="--")
 
             # (0, 0) home marker — where the cut literally starts
