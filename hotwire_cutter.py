@@ -1237,8 +1237,12 @@ def generate_body_gcode(
     lines.append("(Baslangic - Motor home: X0 Y0 Z0 A0)")
     lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
     lines.append("()")
-    lines.append("(Lead-in L-sekli: once Y/Z, sonra X/A; dis kontur giris noktasina)")
-    lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
+    # Body mode uses a SINGLE-LINE diagonal lead-in instead of an L-shape.
+    # Why: an L-shape would cut TWO foam slots (vertical at X=0 then
+    # horizontal at Y=start_y), totalling start_x + start_y of foam waste.
+    # A diagonal cuts ONE slot of length sqrt(start_x^2 + start_y^2),
+    # which is always shorter and uses less material.
+    lines.append("(Lead-in tek hatli: home -> dis kontur giris noktasi)")
     lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
     lines.append("()")
 
@@ -1272,9 +1276,9 @@ def generate_body_gcode(
     lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
     lines.append("()")
 
-    # Lead-out (reverse of lead-in)
-    lines.append("(Lead-out L-sekli: once X/A 0'a, sonra Y/Z 0'a)")
-    lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
+    # Lead-out: reverse of lead-in — single diagonal G01 back to home.
+    # Retraces the same diagonal slot the lead-in cut, no extra material.
+    lines.append("(Lead-out tek hatli: dis kontur giris noktasi -> home)")
     lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Govde Kesim Bitti)")
 
@@ -2464,15 +2468,15 @@ class HotWireCutterApp:
         ax.plot(cl_r[:, 0], np.full(len(cl_r), span), cl_r[:, 1],
                 color="#44FF66", linewidth=2)
 
-        # L-shaped lead-in/out for both carriages
+        # Single-line diagonal lead-in/out for both carriages
         sx = float(left[seg["outer_entry"], 0])
         sy = float(left[seg["outer_entry"], 1])
         sa = float(right[seg["outer_entry"], 0])
         sz = float(right[seg["outer_entry"], 1])
-        ax.plot([0, 0, sx], [0, 0, 0], [0, sy, sy],
+        ax.plot([0, sx], [0, 0], [0, sy],
                 color="#FFAA00", linewidth=1.8, linestyle="--",
-                label="Lead-in / Lead-out (L)")
-        ax.plot([0, 0, sa], [span, span, span], [0, sz, sz],
+                label="Lead-in / Lead-out (diagonal)")
+        ax.plot([0, sa], [span, span], [0, sz],
                 color="#FFAA00", linewidth=1.8, linestyle="--")
 
         # Home markers
@@ -3022,17 +3026,26 @@ class HotWireCutterApp:
                         color=cut_color_right, linewidth=2,
                         label=f"{label_prefix} Sag Carriage (A,Z)")
 
-            # L-shaped lead-in for each carriage (Y first, X second):
-            #   (0, 0) -> (0, start_y) -> (start_x, start_y)
-            # Vertical leg lives on X=0 (plot edge), horizontal leg merges
-            # with the profile's bottom — no stub at mid-chord.
+            # Lead-in shape depends on mode:
+            #   kanat: L-shape (vertical-first, horizontal-second) — keeps
+            #          the horizontal leg merged with the profile's bottom
+            #          edge so it doesn't leave a visible stub.
+            #   govde: single diagonal — minimises the foam slot cut by
+            #          the lead-in (one diagonal line vs. two-leg L).
             lx0 = left[0, 0]; ly0 = left[0, 1]
-            ax.plot([0, 0, lx0], [0, 0, 0], [0, ly0, ly0],
-                    color=approach_color, linewidth=1.8, linestyle="--",
-                    label=f"{label_prefix} Lead-in / Lead-out (L)")
             rx0 = right[0, 0]; ry0 = right[0, 1]
-            ax.plot([0, 0, rx0], [span, span, span], [0, ry0, ry0],
-                    color=approach_color, linewidth=1.8, linestyle="--")
+            if tp.get("mode") == "govde":
+                ax.plot([0, lx0], [0, 0], [0, ly0],
+                        color=approach_color, linewidth=1.8, linestyle="--",
+                        label=f"{label_prefix} Lead-in / Lead-out (diagonal)")
+                ax.plot([0, rx0], [span, span], [0, ry0],
+                        color=approach_color, linewidth=1.8, linestyle="--")
+            else:
+                ax.plot([0, 0, lx0], [0, 0, 0], [0, ly0, ly0],
+                        color=approach_color, linewidth=1.8, linestyle="--",
+                        label=f"{label_prefix} Lead-in / Lead-out (L)")
+                ax.plot([0, 0, rx0], [span, span, span], [0, ry0, ry0],
+                        color=approach_color, linewidth=1.8, linestyle="--")
 
             # (0, 0) home marker — where the cut literally starts
             ax.scatter([0], [0], [0],
