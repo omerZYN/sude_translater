@@ -1446,20 +1446,244 @@ class HotWireCutterApp:
         self._load_body_dxf("tip")
 
     def _select_body_entry(self):
-        """Open the click-select dialog for pocket entry points.
-        Stub for Step 1 — Step 3 implements the matplotlib click handling."""
-        if self.body_root_outer is None:
+        """Open a click-to-select dialog for pocket entry points.
+
+        Layout:
+            - Single matplotlib figure with one (root only) or two (root +
+              tip) sub-axes side-by-side.
+            - Each sub-axis shows that side's outer contour (blue) and inner
+              contour (red), drawn at native DXF scale with equal aspect.
+            - User clicks four points in sequence (or two if no tip DXF):
+                  1) root outer  -> snap to nearest vertex on root outer
+                  2) root inner  -> snap to nearest vertex on root inner
+                  3) tip outer   (if has tip)
+                  4) tip inner   (if has tip)
+            - Clicks on the wrong subplot are ignored (so the user can't
+              accidentally pick a tip vertex while we're expecting a root
+              vertex).
+            - As points come in, green markers + a purple slot line appear,
+              and the prompt label updates to say which point is next.
+
+        Buttons: Onayla (writes to self.body_*_entry), Yeniden Sec (resets
+        click state), Iptal (closes without saving).
+        """
+        if self.body_root_outer is None or self.body_root_inner is None:
             messagebox.showwarning(
                 "Uyari",
-                "Once Govde Root DXF yukleyin."
+                "Once Govde Root DXF yukleyin (dis + ic kontur iceren)."
             )
             return
-        messagebox.showinfo(
-            "Bilgi",
-            "Tiklamali giris noktasi secimi Step 3'te eklenecek.\n\n"
-            "Su an Step 1: mod toggle ve dosya yukleyiciler kuruldu. "
-            "Sonraki adimlarda DXF parser + secim diyalogu eklenecek."
+
+        has_tip = (self.body_tip_outer is not None
+                   and self.body_tip_inner is not None)
+
+        win = tk.Toplevel(self.root)
+        win.title("Sude - Govde Giris Noktasi Sec")
+        win.geometry("1100x720" if has_tip else "700x720")
+        win.minsize(640, 520)
+        win.transient(self.root)
+
+        fig = plt.Figure(figsize=(11 if has_tip else 6.5, 7),
+                         facecolor="#2b2b2b")
+        if has_tip:
+            ax_root = fig.add_subplot(1, 2, 1, facecolor="#1e1e1e")
+            ax_tip = fig.add_subplot(1, 2, 2, facecolor="#1e1e1e")
+        else:
+            ax_root = fig.add_subplot(1, 1, 1, facecolor="#1e1e1e")
+            ax_tip = None
+
+        # Sequence of clicks the user must make. Each entry: (key, contour,
+        # axes-it-must-land-in, color-for-marker).
+        clicks_needed = [
+            ("root_outer", self.body_root_outer, ax_root, "#00FF88"),
+            ("root_inner", self.body_root_inner, ax_root, "#00CCFF"),
+        ]
+        if has_tip:
+            clicks_needed += [
+                ("tip_outer", self.body_tip_outer, ax_tip, "#00FF88"),
+                ("tip_inner", self.body_tip_inner, ax_tip, "#00CCFF"),
+            ]
+
+        state = {"step": 0, "results": {}}
+
+        prompt_var = tk.StringVar(value="")
+
+        def _draw_all():
+            """Redraw both axes from scratch, including any picked points
+            and the slot line(s) drawn so far."""
+            for ax, label_prefix, outer, inner in [
+                (ax_root, "Root", self.body_root_outer, self.body_root_inner),
+                (ax_tip, "Tip",
+                 self.body_tip_outer if has_tip else None,
+                 self.body_tip_inner if has_tip else None),
+            ]:
+                if ax is None:
+                    continue
+                ax.clear()
+                ax.set_facecolor("#1e1e1e")
+                if outer is not None:
+                    pts = np.vstack([outer, outer[:1]])
+                    ax.plot(pts[:, 0], pts[:, 1], color="#4488FF",
+                            linewidth=1.6, label="Dis kontur")
+                if inner is not None:
+                    pts = np.vstack([inner, inner[:1]])
+                    ax.plot(pts[:, 0], pts[:, 1], color="#FF4444",
+                            linewidth=1.6, label="Ic kontur (pocket)")
+
+                outer_key = f"{label_prefix.lower()}_outer"
+                inner_key = f"{label_prefix.lower()}_inner"
+                outer_pt = state["results"].get(outer_key)
+                inner_pt = state["results"].get(inner_key)
+                if outer_pt is not None:
+                    ax.plot(outer_pt[0], outer_pt[1], "o",
+                            markersize=11, markerfacecolor="#00FF88",
+                            markeredgecolor="white", markeredgewidth=1.5,
+                            label="Dis giris")
+                if inner_pt is not None:
+                    ax.plot(inner_pt[0], inner_pt[1], "o",
+                            markersize=11, markerfacecolor="#00CCFF",
+                            markeredgecolor="white", markeredgewidth=1.5,
+                            label="Ic giris")
+                if outer_pt is not None and inner_pt is not None:
+                    ax.plot([outer_pt[0], inner_pt[0]],
+                            [outer_pt[1], inner_pt[1]],
+                            color="#CC66FF", linewidth=2,
+                            linestyle="--", label="Slot")
+
+                ax.set_aspect("equal", adjustable="datalim")
+                ax.set_title(label_prefix, color="white", fontsize=11)
+                ax.tick_params(colors="white", labelsize=8)
+                for spine in ax.spines.values():
+                    spine.set_color("#555555")
+                ax.grid(True, alpha=0.2, color="#555555")
+                ax.legend(loc="upper right", fontsize=8,
+                          facecolor="#333333", edgecolor="#555555",
+                          labelcolor="white")
+
+            # Update prompt text under the canvas
+            if state["step"] < len(clicks_needed):
+                key, _, expected_ax, _ = clicks_needed[state["step"]]
+                pretty = {
+                    "root_outer": "ROOT — DIS kontur (slot baslangici)",
+                    "root_inner": "ROOT — IC kontur (pocket kesim baslangici)",
+                    "tip_outer": "TIP — DIS kontur (slot baslangici)",
+                    "tip_inner": "TIP — IC kontur (pocket kesim baslangici)",
+                }[key]
+                prompt_var.set(
+                    f"Adim {state['step']+1}/{len(clicks_needed)} — {pretty} "
+                    f"icin tikla. Tiklanan en yakin vertex'e snap edilir."
+                )
+            else:
+                prompt_var.set(
+                    "Tum noktalar secildi. ONAYLA tusuna basabilirsin."
+                )
+            canvas_widget.draw()
+
+        def _on_click(event):
+            if state["step"] >= len(clicks_needed):
+                return
+            if event.inaxes is None or event.xdata is None:
+                return
+            key, contour, expected_ax, _ = clicks_needed[state["step"]]
+            if event.inaxes is not expected_ax:
+                # Wrong subplot — silently ignore so the user knows their
+                # click didn't count.
+                return
+            click_xy = np.array([event.xdata, event.ydata])
+            dists = np.linalg.norm(contour - click_xy, axis=1)
+            best = int(np.argmin(dists))
+            state["results"][key] = (
+                float(contour[best, 0]),
+                float(contour[best, 1]),
+            )
+            state["step"] += 1
+            _draw_all()
+
+        def _reset():
+            state["step"] = 0
+            state["results"] = {}
+            _draw_all()
+
+        def _confirm():
+            if state["step"] < len(clicks_needed):
+                messagebox.showwarning(
+                    "Uyari",
+                    f"Tum {len(clicks_needed)} nokta secilmedi "
+                    f"({state['step']}/{len(clicks_needed)})."
+                )
+                return
+            r = state["results"]
+            self.body_root_outer_entry = r["root_outer"]
+            self.body_root_inner_entry = r["root_inner"]
+            if has_tip:
+                self.body_tip_outer_entry = r["tip_outer"]
+                self.body_tip_inner_entry = r["tip_inner"]
+            else:
+                # Straight body — root entries also serve as tip entries so
+                # the toolpath builder doesn't have to special-case "no tip".
+                self.body_tip_outer_entry = r["root_outer"]
+                self.body_tip_inner_entry = r["root_inner"]
+            ro = self.body_root_outer_entry
+            ri = self.body_root_inner_entry
+            if has_tip:
+                to = self.body_tip_outer_entry
+                ti = self.body_tip_inner_entry
+                txt = (
+                    f"R:({ro[0]:.1f},{ro[1]:.1f})->({ri[0]:.1f},{ri[1]:.1f})  "
+                    f"T:({to[0]:.1f},{to[1]:.1f})->({ti[0]:.1f},{ti[1]:.1f})"
+                )
+            else:
+                txt = (f"({ro[0]:.1f},{ro[1]:.1f}) -> "
+                       f"({ri[0]:.1f},{ri[1]:.1f})")
+            self.body_entry_label.config(text=txt, foreground="purple")
+            self.status_var.set("Govde giris noktalari kaydedildi.")
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        # --- Build the layout (button row first so it reserves space) ---
+        bottom = ttk.Frame(win, padding=8)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+
+        prompt_label = ttk.Label(
+            bottom, textvariable=prompt_var, foreground="#0066CC",
+            font=("Arial", 10, "bold"),
         )
+        prompt_label.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+
+        tk.Button(
+            bottom, text="  Onayla  ", command=_confirm,
+            bg="#00A86B", fg="white", activebackground="#008c5a",
+            activeforeground="white",
+            font=("Arial", 10, "bold"), relief=tk.RAISED, bd=2,
+            cursor="hand2", padx=8, pady=4,
+        ).pack(side=tk.RIGHT, padx=4)
+        tk.Button(
+            bottom, text="  Yeniden Sec  ", command=_reset,
+            bg="#3366CC", fg="white", activebackground="#2a55a8",
+            activeforeground="white",
+            font=("Arial", 10, "bold"), relief=tk.RAISED, bd=2,
+            cursor="hand2", padx=8, pady=4,
+        ).pack(side=tk.RIGHT, padx=4)
+        tk.Button(
+            bottom, text="  Iptal  ", command=_cancel,
+            bg="#999999", fg="white", activebackground="#777777",
+            activeforeground="white",
+            font=("Arial", 10, "bold"), relief=tk.RAISED, bd=2,
+            cursor="hand2", padx=8, pady=4,
+        ).pack(side=tk.RIGHT, padx=4)
+
+        # Canvas last, so it claims the remaining space
+        canvas_widget = FigureCanvasTkAgg(fig, master=win)
+        canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH,
+                                           expand=True)
+        fig.canvas.mpl_connect("button_press_event", _on_click)
+
+        # Cancel on window-close
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+
+        _draw_all()
 
     def _get_params(self):
         try:
