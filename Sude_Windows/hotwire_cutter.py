@@ -2020,24 +2020,57 @@ class HotWireCutterApp:
                           labelcolor="white")
 
             # Update prompt text under the canvas
-            if state["step"] < len(clicks_needed):
-                key, _, expected_ax, _ = clicks_needed[state["step"]]
+            n_filled = sum(1 for k, _, _, _ in clicks_needed
+                           if k in state["results"])
+            if n_filled < len(clicks_needed):
+                # Find the first missing key in the canonical order
+                missing_key = next(
+                    k for k, _, _, _ in clicks_needed
+                    if k not in state["results"]
+                )
                 pretty = {
                     "root_outer": "ROOT — DIS kontur (slot baslangici)",
                     "root_inner": "ROOT — IC kontur (pocket kesim baslangici)",
                     "tip_outer": "TIP — DIS kontur (slot baslangici)",
                     "tip_inner": "TIP — IC kontur (pocket kesim baslangici)",
-                }[key]
+                }[missing_key]
                 prompt_var.set(
-                    f"Adim {state['step']+1}/{len(clicks_needed)} — {pretty} "
-                    f"icin tikla. Konturun uzerinde herhangi bir noktaya "
-                    f"(kose veya kenar ortasi) tiklanabilir."
+                    f"{n_filled}/{len(clicks_needed)} secildi — {pretty}. "
+                    f"Tikla VEYA asagidan X/Y yazip 'Uygula' tusuna bas."
                 )
             else:
                 prompt_var.set(
                     "Tum noktalar secildi. ONAYLA tusuna basabilirsin."
                 )
             canvas_widget.draw()
+
+        # Editable X/Y string-vars, one pair per result key. Filled in on
+        # click and read by the "Bu degerleri kullan" buttons below the
+        # canvas. Lets the user set entry coords by typing exact numbers
+        # (e.g. (0, 0)) when a click can't reach the precise spot.
+        coord_vars = {}
+        for key, _, _, _ in clicks_needed:
+            coord_vars[key] = (tk.StringVar(value=""), tk.StringVar(value=""))
+
+        def _set_result(key, x, y, contour):
+            """Project (x,y) onto the given contour, store as the result for
+            `key`, and update its coord text fields. Increments step if not
+            already past it."""
+            proj, _, _ = _project_onto_polygon_edges(
+                contour, np.array([x, y], dtype=float)
+            )
+            state["results"][key] = (float(proj[0]), float(proj[1]))
+            coord_vars[key][0].set(f"{proj[0]:.2f}")
+            coord_vars[key][1].set(f"{proj[1]:.2f}")
+            # Recompute step: number of results currently filled, in
+            # clicks_needed order, so the prompt shows the next missing one.
+            n_filled = 0
+            for k, _, _, _ in clicks_needed:
+                if k in state["results"]:
+                    n_filled += 1
+                else:
+                    break
+            state["step"] = n_filled
 
         def _on_click(event):
             if state["step"] >= len(clicks_needed):
@@ -2048,12 +2081,7 @@ class HotWireCutterApp:
             if event.inaxes is not expected_ax:
                 # Wrong subplot — silently ignore.
                 return
-            click_xy = np.array([event.xdata, event.ydata])
-            # Project to nearest point on any edge (not just nearest vertex)
-            # so the user can pick midpoints of faces, not just corners.
-            proj, _, _ = _project_onto_polygon_edges(contour, click_xy)
-            state["results"][key] = (float(proj[0]), float(proj[1]))
-            state["step"] += 1
+            _set_result(key, event.xdata, event.ydata, contour)
             _draw_all()
 
         def _reset():
@@ -2062,11 +2090,15 @@ class HotWireCutterApp:
             _draw_all()
 
         def _confirm():
-            if state["step"] < len(clicks_needed):
+            # Onayla works once every key has a result, regardless of the
+            # order in which the user filled them in (clicks vs. text).
+            missing = [k for k, _, _, _ in clicks_needed
+                       if k not in state["results"]]
+            if missing:
                 messagebox.showwarning(
                     "Uyari",
-                    f"Tum {len(clicks_needed)} nokta secilmedi "
-                    f"({state['step']}/{len(clicks_needed)})."
+                    f"Tum noktalar secilmedi. Eksikler:\n  "
+                    + "\n  ".join(missing)
                 )
                 return
             r = state["results"]
@@ -2130,6 +2162,54 @@ class HotWireCutterApp:
             font=("Arial", 10, "bold"), relief=tk.RAISED, bd=2,
             cursor="hand2", padx=8, pady=4,
         ).pack(side=tk.RIGHT, padx=4)
+
+        # --- Manual coordinate input row(s) — pack BEFORE the canvas so
+        # they appear ABOVE the bottom button bar but BELOW the plot. The
+        # user can either click on the plot or type exact values here.
+        coords_frame = ttk.LabelFrame(
+            win, text="Tam koordinat ile sec (tikla VEYA yaz)", padding=4
+        )
+        coords_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=2)
+
+        def _make_coord_row(parent, label_text, key, contour):
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, pady=1)
+            ttk.Label(row, text=label_text, width=32,
+                      font=("Arial", 9)).pack(side=tk.LEFT)
+            ttk.Label(row, text="X:").pack(side=tk.LEFT)
+            x_var, y_var = coord_vars[key]
+            x_entry = ttk.Entry(row, textvariable=x_var, width=10)
+            x_entry.pack(side=tk.LEFT, padx=2)
+            ttk.Label(row, text="Y:").pack(side=tk.LEFT)
+            y_entry = ttk.Entry(row, textvariable=y_var, width=10)
+            y_entry.pack(side=tk.LEFT, padx=2)
+
+            def _apply(_event=None):
+                try:
+                    x = float(x_var.get())
+                    y = float(y_var.get())
+                except ValueError:
+                    messagebox.showwarning(
+                        "Uyari",
+                        f"Gecerli sayisal X ve Y degerleri gir."
+                    )
+                    return
+                _set_result(key, x, y, contour)
+                _draw_all()
+
+            ttk.Button(row, text="Uygula",
+                       command=_apply).pack(side=tk.LEFT, padx=4)
+            x_entry.bind("<Return>", _apply)
+            y_entry.bind("<Return>", _apply)
+
+        pretty_labels = {
+            "root_outer": "ROOT — Dis giris (slot baslangici):",
+            "root_inner": "ROOT — Ic giris (pocket baslangici):",
+            "tip_outer": "TIP — Dis giris (slot baslangici):",
+            "tip_inner": "TIP — Ic giris (pocket baslangici):",
+        }
+        for key, contour, _, _ in clicks_needed:
+            _make_coord_row(coords_frame, pretty_labels[key], key, contour)
 
         # Canvas last, so it claims the remaining space
         canvas_widget = FigureCanvasTkAgg(fig, master=win)
