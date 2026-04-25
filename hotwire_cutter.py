@@ -533,13 +533,26 @@ def _roll_to_mid_lower(points):
     return rolled, start_idx
 
 
-def apply_kerf_offset(points, kerf):
-    """Apply kerf (wire diameter) offset to the profile."""
+def apply_kerf_offset(points, kerf, outward=True):
+    """Apply kerf (wire diameter) offset to a closed contour.
+
+    The function expects a CW-oriented polygon (matching the kanat pipeline).
+    For CW winding, the left-perpendicular of an edge points OUTWARD from
+    the polygon — so the default offset GROWS the contour by kerf/2, which
+    is the right direction for OUTER cuts (wing or body): the wire ends up
+    outside the DXF outline by kerf/2, and the molten kerf reaches inward
+    to put the kept piece's edge exactly at the DXF.
+
+    For INNER pocket cuts, pass outward=False. The polygon SHRINKS by kerf/2
+    instead — the wire moves toward the pocket interior and the molten kerf
+    reaches outward to put the hole's edge at the DXF inner outline.
+    """
     if kerf <= 0:
         return points
 
     n = len(points)
     offset_pts = np.zeros_like(points)
+    sign = 1.0 if outward else -1.0
 
     for i in range(n):
         p_prev = points[(i - 1) % n]
@@ -550,7 +563,7 @@ def apply_kerf_offset(points, kerf):
         v1 = p_curr - p_prev
         v2 = p_next - p_curr
 
-        # Normals (pointing outward assuming CCW winding)
+        # Left-perpendiculars (outward for CW winding)
         n1 = np.array([-v1[1], v1[0]])
         n2 = np.array([-v2[1], v2[0]])
 
@@ -562,16 +575,38 @@ def apply_kerf_offset(points, kerf):
         if len2 > 1e-10:
             n2 /= len2
 
-        # Average normal
         n_avg = n1 + n2
         n_len = np.linalg.norm(n_avg)
         if n_len > 1e-10:
             n_avg /= n_len
 
-        # Offset inward (shrink profile) - sign depends on winding direction
-        offset_pts[i] = p_curr + n_avg * (kerf / 2.0)
+        offset_pts[i] = p_curr + n_avg * sign * (kerf / 2.0)
 
     return offset_pts
+
+
+def _roll_to_vertex(points, target_xy):
+    """Roll a polygon array so that points[0] is the vertex closest to
+    target_xy. Used to start a body cut at the user-picked entry vertex.
+    Returns (rolled_points, original_index)."""
+    target = np.asarray(target_xy, dtype=float)
+    dists = np.linalg.norm(points - target, axis=1)
+    start_idx = int(np.argmin(dists))
+    rolled = np.roll(points, -start_idx, axis=0)
+    return rolled, start_idx
+
+
+def _normalize_body_contour(outer_pts):
+    """Shift a body contour so its outer bounding-box corner sits at (0, 0).
+    The returned shift should be applied to every related array (inner
+    contour + entry points) so they stay in the same frame as the outer.
+    Unlike normalize_profile (kanat), we do NOT roll the array — body
+    contours don't have an LE feature to anchor on, the click-picked entry
+    point is what determines the cut start order."""
+    x_min = float(outer_pts[:, 0].min())
+    y_min = float(outer_pts[:, 1].min())
+    shift = np.array([x_min, y_min])
+    return outer_pts - shift, shift
 
 
 def apply_taper_projection(root_pts, tip_pts, span, foam_width, foam_left_offset):
@@ -839,6 +874,281 @@ def generate_spar_gcode(root_pts, tip_pts, params):
     lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
     lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Spar Kesim Bitti)")
+
+    return "\n".join(lines)
+
+
+def build_body_machine_toolpath(
+    root_outer, root_inner, tip_outer, tip_inner,
+    root_outer_entry, root_inner_entry,
+    tip_outer_entry, tip_inner_entry,
+    params,
+):
+    """Build the machine-coordinate toolpath for body (govde) mode.
+
+    Cut sequence (per side):
+        1) outer entry  — cut start (lead-in connects (0,0) -> here)
+        2) slot inward  — straight G01 from outer entry to inner entry
+        3) inner pocket — CW around the inner contour, rolled so it begins
+           at the user's inner-entry vertex
+        4) close inner  — back to inner entry
+        5) slot outward — straight G01 back to outer entry
+        6) outer contour — CW around the outer contour, rolled so it begins
+           at the user's outer-entry vertex
+        7) (G-code generator's closing G01 returns to outer entry, then the
+           lead-out goes to home)
+
+    Kerf direction:
+        - outer contour: outward=True   (wire OUTSIDE the DXF outline)
+        - inner pocket : outward=False  (wire INSIDE the pocket, melt grows
+                                         outward to reach the DXF inner edge)
+
+    Body coordinate normalization (per side):
+        Each side's outer bounding-box min corner is shifted to (0, 0). The
+        shift is also applied to that side's inner contour AND its entry
+        points so they stay in the same frame. Root and tip are normalized
+        INDEPENDENTLY — the X offsets (root_x_offset / tip_x_offset) align
+        them in machine space the same way kanat mode does.
+
+    Single-pocket assumption: only one inner contour per side. Multi-pocket
+    support would require sequential pocket sections between outer cuts and
+    is left for later.
+
+    Constraint: root and tip must produce point sequences of equal length
+    so apply_taper_projection can pair them index-by-index. Today this is
+    enforced by requiring matching outer-vertex counts AND matching inner-
+    vertex counts. Step 6 will add resampling for mismatched counts.
+    """
+    feed = params["feed_rate"]
+    span = params.get("span", params["foam_width"])
+    foam_width = params["foam_width"]
+    foam_left_offset = params.get("foam_left_offset", 0.0)
+    root_x_offset = params.get("root_x_offset", 0.0)
+    tip_x_offset = params.get("tip_x_offset", 0.0)
+    root_y_offset = params.get("root_y_offset", 0.0)
+    tip_z_offset = params.get("tip_z_offset", 0.0)
+    kerf = params["kerf"]
+    wire_tol = params.get("wire_tolerance", 0.0)
+    total_offset = kerf + wire_tol
+
+    def _prep(outer, inner, outer_entry, inner_entry):
+        outer = np.asarray(outer, dtype=float).copy()
+        inner = np.asarray(inner, dtype=float).copy()
+
+        # Shift so outer's bbox corner is at (0,0); inner + entries follow
+        outer_shifted, shift = _normalize_body_contour(outer)
+        inner_shifted = inner - shift
+        outer_entry_n = np.asarray(outer_entry, dtype=float) - shift
+        inner_entry_n = np.asarray(inner_entry, dtype=float) - shift
+
+        # Force CW winding so kerf direction is consistent with kanat code
+        outer_shifted = _orient_cw(_ensure_ccw(outer_shifted))
+        inner_shifted = _orient_cw(_ensure_ccw(inner_shifted))
+
+        # Roll arrays so cut starts at the user-picked vertex
+        outer_shifted, _ = _roll_to_vertex(outer_shifted, outer_entry_n)
+        inner_shifted, _ = _roll_to_vertex(inner_shifted, inner_entry_n)
+
+        # Apply kerf — outer grows, inner shrinks
+        if total_offset > 0:
+            outer_shifted = apply_kerf_offset(
+                outer_shifted, total_offset, outward=True
+            )
+            inner_shifted = apply_kerf_offset(
+                inner_shifted, total_offset, outward=False
+            )
+
+        # After kerf the start vertex moved slightly; use the new first
+        # vertex as the actual entry point so the slot lines line up with
+        # the rolled contour exactly.
+        outer_entry_actual = outer_shifted[0].copy()
+        inner_entry_actual = inner_shifted[0].copy()
+
+        return outer_shifted, inner_shifted, outer_entry_actual, inner_entry_actual
+
+    root_outer_p, root_inner_p, root_oe, root_ie = _prep(
+        root_outer, root_inner, root_outer_entry, root_inner_entry
+    )
+    tip_outer_p, tip_inner_p, tip_oe, tip_ie = _prep(
+        tip_outer, tip_inner, tip_outer_entry, tip_inner_entry
+    )
+
+    if len(root_outer_p) != len(tip_outer_p):
+        raise ValueError(
+            "Root ve tip govde DIS kontur nokta sayilari farkli "
+            f"({len(root_outer_p)} != {len(tip_outer_p)}). "
+            "Su an ayni vertex sayili DXF'ler destekleniyor."
+        )
+    if len(root_inner_p) != len(tip_inner_p):
+        raise ValueError(
+            "Root ve tip govde IC kontur nokta sayilari farkli "
+            f"({len(root_inner_p)} != {len(tip_inner_p)}). "
+            "Su an ayni vertex sayili DXF'ler destekleniyor."
+        )
+
+    # Build the per-side point sequence (outer entry -> slot in -> inner CW
+    # -> close inner -> slot out -> outer CW). Skip the first vertex of each
+    # closed loop because we're already AT that vertex (avoids a no-op G01).
+    def _build_sequence(outer_p, inner_p, outer_entry, inner_entry):
+        return np.vstack([
+            outer_entry[None, :],         # 0: cut start
+            inner_entry[None, :],         # 1: slot inward
+            inner_p[1:],                  # walk inner CW (skip start)
+            inner_entry[None, :],         # close inner
+            outer_entry[None, :],         # slot outward
+            outer_p[1:],                  # walk outer CW (skip start)
+        ])
+
+    root_seq = _build_sequence(root_outer_p, root_inner_p, root_oe, root_ie)
+    tip_seq = _build_sequence(tip_outer_p, tip_inner_p, tip_oe, tip_ie)
+
+    # Segment marker indices (used by generate_body_gcode for per-segment
+    # commentary and by the 3D preview for color-coded rendering).
+    inner_len = len(root_inner_p) - 1  # walked-inner count (excludes start)
+    outer_len = len(root_outer_p) - 1  # walked-outer count
+    segments = {
+        "outer_entry": 0,
+        "slot_in_end": 1,                       # at inner_entry
+        "inner_walk_end": 1 + inner_len,        # last walked inner vertex
+        "inner_close": 2 + inner_len,           # back to inner_entry
+        "slot_out_end": 3 + inner_len,          # at outer_entry again
+        "outer_walk_end": 3 + inner_len + outer_len,  # last walked outer vertex
+    }
+
+    # X offsets BEFORE taper projection so sweep is baked into the carriage
+    # extrapolation (matches kanat behavior).
+    root_seq[:, 0] += root_x_offset
+    tip_seq[:, 0] += tip_x_offset
+
+    left, right = apply_taper_projection(
+        root_seq, tip_seq, span, foam_width, foam_left_offset
+    )
+    left = left.copy()
+    right = right.copy()
+
+    # Y/Z offsets at carriage level
+    left[:, 1] += root_y_offset
+    right[:, 1] += tip_z_offset
+
+    # Auto-shift to non-negative machine coordinates (X/A together so sweep
+    # geometry is preserved; Y and Z independently)
+    xa_min = min(float(left[:, 0].min()), float(right[:, 0].min()))
+    if xa_min < 0:
+        left[:, 0] -= xa_min
+        right[:, 0] -= xa_min
+    y_min = float(left[:, 1].min())
+    if y_min < 0:
+        left[:, 1] -= y_min
+    z_min = float(right[:, 1].min())
+    if z_min < 0:
+        right[:, 1] -= z_min
+
+    root_chord = float(np.max(root_outer_p[:, 0]) - np.min(root_outer_p[:, 0]))
+    tip_chord = float(np.max(tip_outer_p[:, 0]) - np.min(tip_outer_p[:, 0]))
+
+    return {
+        "left": left,
+        "right": right,
+        "home": (0.0, 0.0, 0.0, 0.0),
+        "root_chord": root_chord,
+        "tip_chord": tip_chord,
+        "total_offset": total_offset,
+        "feed": feed,
+        "segments": segments,
+        "mode": "govde",
+    }
+
+
+def generate_body_gcode(
+    root_outer, root_inner, tip_outer, tip_inner,
+    root_outer_entry, root_inner_entry,
+    tip_outer_entry, tip_inner_entry,
+    params,
+):
+    """Generate G-code for govde (body) cutting: pocket first, then outer."""
+    profile_name = params.get("profile_name", "Govde")
+    span = params.get("span", params["foam_width"])
+    foam_width = params["foam_width"]
+    foam_left_offset = params.get("foam_left_offset", 0.0)
+    kerf = params["kerf"]
+    wire_tol = params.get("wire_tolerance", 0.0)
+
+    tp = build_body_machine_toolpath(
+        root_outer, root_inner, tip_outer, tip_inner,
+        root_outer_entry, root_inner_entry,
+        tip_outer_entry, tip_inner_entry,
+        params,
+    )
+    left = tp["left"]
+    right = tp["right"]
+    feed = tp["feed"]
+    seg = tp["segments"]
+
+    lines = []
+    lines.append(f"(Sude HotWire Foam Cutter - GOVDE - {profile_name})")
+    lines.append(f"(Outer chord Root: {tp['root_chord']:.1f}mm, Tip: {tp['tip_chord']:.1f}mm)")
+    lines.append(f"(Tel Mesafesi: {span:.1f}mm, Kopuk: {foam_width:.1f}mm)")
+    lines.append(f"(Speed: {feed} mm/min)")
+    lines.append(f"(Kerf: {kerf:.2f}mm, Tel Tolerans: {wire_tol:.2f}mm, "
+                 f"Toplam Offset: {tp['total_offset']:.2f}mm)")
+    lines.append(f"(Kerf yonu: dis kontur DISA, ic pocket ICE)")
+    if not np.isclose(foam_width, span):
+        lines.append("(Taper Projeksiyon: AKTIF)")
+    lines.append(f"(Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')})")
+    lines.append("G21 (Metric)")
+    lines.append("G90 (Absolute)")
+    lines.append("G49 (Cancel offsets)")
+    lines.append("()")
+
+    # Lead-in: home -> outer entry (L-shape, vertical first then horizontal)
+    start_x = float(left[seg["outer_entry"]][0])
+    start_y = float(left[seg["outer_entry"]][1])
+    start_a = float(right[seg["outer_entry"]][0])
+    start_z = float(right[seg["outer_entry"]][1])
+
+    lines.append("(Baslangic - Motor home: X0 Y0 Z0 A0)")
+    lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
+    lines.append("()")
+    lines.append("(Lead-in L-sekli: once Y/Z, sonra X/A; dis kontur giris noktasina)")
+    lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
+    lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
+    lines.append("()")
+
+    # The toolpath array starts AT the outer entry (index 0). We've already
+    # moved there with the lead-in, so we walk from index 1 onward.
+    def _emit(i, label=None):
+        if label:
+            lines.append(f"({label})")
+        x = left[i][0]; y = left[i][1]
+        a = right[i][0]; z = right[i][1]
+        lines.append(f"G01 X{x:.2f} Y{y:.2f} Z{z:.2f} A{a:.2f} F{feed}")
+
+    lines.append(f"(=== POCKET KESIMI - Slot iceriye ===)")
+    _emit(seg["slot_in_end"])  # slot to inner entry
+
+    lines.append(f"(=== POCKET - Ic kontur CW ===)")
+    for i in range(seg["slot_in_end"] + 1, seg["inner_walk_end"] + 1):
+        _emit(i)
+    _emit(seg["inner_close"], "Pocket kapan")
+
+    lines.append("()")
+    lines.append(f"(=== Slot disariya - dis kontura geri ===)")
+    _emit(seg["slot_out_end"])
+
+    lines.append(f"(=== DIS KONTUR KESIMI - CW ===)")
+    for i in range(seg["slot_out_end"] + 1, seg["outer_walk_end"] + 1):
+        _emit(i)
+
+    # Close outer back to outer entry
+    lines.append("(Dis kontur kapan)")
+    lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
+    lines.append("()")
+
+    # Lead-out (reverse of lead-in)
+    lines.append("(Lead-out L-sekli: once X/A 0'a, sonra Y/Z 0'a)")
+    lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
+    lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
+    lines.append("(Govde Kesim Bitti)")
 
     return "\n".join(lines)
 
@@ -2075,16 +2385,14 @@ class HotWireCutterApp:
 
     def _generate(self):
         """Build the toolpath, show the 3D confirmation preview, and only
-        emit G-code after the user approves."""
-        if self.root_profile is None:
-            messagebox.showwarning("Uyari", "Lutfen once bir Root profil DXF yukleyin!")
-            return
-
+        emit G-code after the user approves. Branches on self.mode_var:
+        kanat (wing) -> build_machine_toolpath + generate_gcode
+        govde (body) -> build_body_machine_toolpath + generate_body_gcode
+        """
         params = self._get_params()
         if params is None:
             return
 
-        # Validate taper parameters
         span = params["span"]
         foam_w = params["foam_width"]
         foam_lo = params["foam_left_offset"]
@@ -2101,12 +2409,19 @@ class HotWireCutterApp:
                 f"Tel mesafesinden ({span:.1f}mm) buyuk olamaz!")
             return
 
+        if self.mode_var.get() == "govde":
+            self._generate_govde(params)
+            return
+
+        # --- Kanat mode (existing behavior) ---
+        if self.root_profile is None:
+            messagebox.showwarning("Uyari", "Lutfen once bir Root profil DXF yukleyin!")
+            return
+
         try:
             root_interp, tip_interp = self._process_profiles(params)
             spar_root, spar_tip = self._process_spar_profiles(params)
 
-            # Compute the final machine toolpath(s) once, to both render the
-            # preview and (on confirm) emit the G-code from the same data.
             main_tp = build_machine_toolpath(root_interp, tip_interp, params)
             spar_tp = None
             if spar_root is not None:
@@ -2114,7 +2429,7 @@ class HotWireCutterApp:
 
             warnings = check_machine_limits(
                 main_tp["left"], main_tp["right"],
-                root_y_offset=0.0, tip_z_offset=0.0,  # already baked in
+                root_y_offset=0.0, tip_z_offset=0.0,
             )
             if warnings:
                 msg = "Makine limiti uyarilari:\n\n" + "\n".join(warnings)
@@ -2130,25 +2445,88 @@ class HotWireCutterApp:
         except Exception as e:
             messagebox.showerror("Hata", f"Toolpath hesabi sirasinda hata:\n{e}")
 
-    def _finalize_gcode(self, root_interp, tip_interp, spar_root, spar_tip, params):
-        """Called after the user confirms the toolpath preview. Produces the
-        G-code text, writes it to the main window, and persists settings."""
-        try:
-            gcode = generate_gcode(root_interp.copy(), tip_interp.copy(), params)
+    def _generate_govde(self, params):
+        """Body mode: validate state, build pocket+outer toolpath, show
+        the same confirmation 3D preview, then emit body G-code on confirm."""
+        if self.body_root_outer is None or self.body_root_inner is None:
+            messagebox.showwarning(
+                "Uyari",
+                "Govde Root DXF yuklenmemis (dis + ic kontur bekleniyor)."
+            )
+            return
+        if self.body_root_outer_entry is None or self.body_root_inner_entry is None:
+            messagebox.showwarning(
+                "Uyari",
+                "Giris noktalari secilmemis. 'Sec' butonu ile dis ve ic "
+                "kontur uzerinde noktalari belirle."
+            )
+            return
 
-            if spar_root is not None:
-                spar_gcode = generate_spar_gcode(
-                    spar_root.copy(), spar_tip.copy(), params
-                )
-                # Drop the main cut's L-shaped lead-out + "Kesim Bitti" lines
-                # so the spar section can start fresh from home (it emits its
-                # own home + lead-in block). Main lead-out is 4 lines:
-                #   (Lead-out L-sekli ...)  <- comment
-                #   G01 ... Y0 Z0 ...        <- Y/Z to 0
-                #   G01 X0 Y0 Z0 A0          <- X/A to 0
-                #   (Kesim Bitti)            <- comment
-                main_lines = gcode.split("\n")
-                gcode = "\n".join(main_lines[:-4]) + "\n" + spar_gcode
+        # Tip falls back to root for straight prismatic body
+        if self.body_tip_outer is None or self.body_tip_inner is None:
+            tip_outer = self.body_root_outer
+            tip_inner = self.body_root_inner
+            tip_outer_entry = self.body_root_outer_entry
+            tip_inner_entry = self.body_root_inner_entry
+        else:
+            tip_outer = self.body_tip_outer
+            tip_inner = self.body_tip_inner
+            tip_outer_entry = (self.body_tip_outer_entry
+                               or self.body_root_outer_entry)
+            tip_inner_entry = (self.body_tip_inner_entry
+                               or self.body_root_inner_entry)
+
+        try:
+            main_tp = build_body_machine_toolpath(
+                self.body_root_outer, self.body_root_inner,
+                tip_outer, tip_inner,
+                self.body_root_outer_entry, self.body_root_inner_entry,
+                tip_outer_entry, tip_inner_entry,
+                params,
+            )
+
+            warnings = check_machine_limits(
+                main_tp["left"], main_tp["right"],
+                root_y_offset=0.0, tip_z_offset=0.0,
+            )
+            if warnings:
+                msg = "Makine limiti uyarilari:\n\n" + "\n".join(warnings)
+                msg += "\n\nYine de onay penceresine gecmek istiyor musunuz?"
+                if not messagebox.askyesno("Uyari", msg):
+                    return
+
+            self._show_toolpath_confirm(
+                main_tp, None, None, None, None, None, params,
+                body_args=(
+                    self.body_root_outer, self.body_root_inner,
+                    tip_outer, tip_inner,
+                    self.body_root_outer_entry, self.body_root_inner_entry,
+                    tip_outer_entry, tip_inner_entry,
+                ),
+            )
+        except Exception as e:
+            messagebox.showerror("Hata", f"Govde toolpath hatasi:\n{e}")
+
+    def _finalize_gcode(self, root_interp, tip_interp, spar_root, spar_tip,
+                        params, body_args=None):
+        """Called after the user confirms the toolpath preview. Produces the
+        G-code text, writes it to the main window, and persists settings.
+        body_args: tuple of (root_outer, root_inner, tip_outer, tip_inner,
+        root_oe, root_ie, tip_oe, tip_ie) — when present, runs body G-code
+        instead of kanat."""
+        try:
+            if body_args is not None:
+                gcode = generate_body_gcode(*body_args, params)
+            else:
+                gcode = generate_gcode(root_interp.copy(), tip_interp.copy(), params)
+
+                if spar_root is not None:
+                    spar_gcode = generate_spar_gcode(
+                        spar_root.copy(), spar_tip.copy(), params
+                    )
+                    # Drop the main cut's L-shaped lead-out + "Kesim Bitti"
+                    main_lines = gcode.split("\n")
+                    gcode = "\n".join(main_lines[:-4]) + "\n" + spar_gcode
 
             self.generated_gcode = gcode
 
@@ -2160,17 +2538,20 @@ class HotWireCutterApp:
             line_count = gcode.count("\n") + 1
             self.status_var.set(f"G-code uretildi: {line_count} satir")
 
-            # Persist the values the user just approved
             self._save_settings()
         except Exception as e:
             messagebox.showerror("Hata", f"G-code uretim hatasi:\n{e}")
 
     def _show_toolpath_confirm(self, main_tp, spar_tp,
                                root_interp, tip_interp,
-                               spar_root, spar_tip, params):
+                               spar_root, spar_tip, params,
+                               body_args=None):
         """Open a modal-style 3D window showing the exact toolpath the machine
         will follow (both carriages, approach/retract, start marker). The user
-        must click Onayla to produce the G-code — Iptal just closes."""
+        must click Onayla to produce the G-code — Iptal just closes.
+
+        body_args: when present, the confirm dialog is for govde mode and
+        on confirm we route to generate_body_gcode instead of generate_gcode."""
         win = tk.Toplevel(self.root)
         win.title("Sude - Toolpath Onayi")
         win.geometry("1000x720")
@@ -2315,7 +2696,8 @@ class HotWireCutterApp:
         def _confirm():
             win.destroy()
             self._finalize_gcode(root_interp, tip_interp,
-                                 spar_root, spar_tip, params)
+                                 spar_root, spar_tip, params,
+                                 body_args=body_args)
 
         def _cancel():
             win.destroy()
