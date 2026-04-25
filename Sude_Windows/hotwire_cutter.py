@@ -717,6 +717,67 @@ def _insert_entry_vertex(polygon, entry_xy, tol=1e-3):
     return np.insert(pts, edge_i + 1, proj, axis=0)
 
 
+def _pick_body_lead_in_axis(
+    left_pts, right_pts, sx, sy, sa, sz, tol=0.5
+):
+    """Decide Y-first vs X-first L-shape lead-in for a body cut so that
+    neither leg cuts through the body interior.
+
+    Each L has two segments; one of them passes through the (X, Y) plane
+    of the body (or (A, Z) of the right carriage). The leg is SAFE if it:
+        - sits on a face that the body's bbox doesn't intersect, OR
+        - rides exactly along one of the body's bbox edges (then it just
+          retraces what the outer cut would do anyway — no extra slot).
+
+    Y-first L: leg 1 is vertical at X=A=0 (always outside body since X
+    offset puts the body at X >= some positive value). Leg 2 is
+    horizontal at Y=sy / Z=sz from X=0 to X=sx. This passes through body
+    interior IFF sy is strictly between ymin and ymax AND sx > xmin —
+    i.e. when the entry is on the body's RIGHT edge or interior.
+
+    X-first L: leg 1 is horizontal at Y=Z=0 (outside body when there's a
+    Y offset). Leg 2 is vertical at X=sx / A=sa from Y=0 to Y=sy. Passes
+    through body interior IFF sx is strictly between xmin and xmax AND
+    sy > ymin — i.e. when the entry is on the body's TOP edge or interior.
+
+    Rule of thumb:
+        TOP edge entry  → Y-first (horizontal at top stays on top edge)
+        RIGHT edge entry → X-first (vertical at right stays on right edge)
+        Bottom or left   → either, default Y-first (matches kanat).
+
+    Returns 'y' or 'x'.
+    """
+    lxmin, lymin = left_pts.min(axis=0)
+    lxmax, lymax = left_pts.max(axis=0)
+    rxmin, rymin = right_pts.min(axis=0)
+    rxmax, rymax = right_pts.max(axis=0)
+
+    def y_first_safe(ex, ey, xmin, ymin, xmax, ymax):
+        return (ey <= ymin + tol
+                or ey >= ymax - tol
+                or ex <= xmin + tol)
+
+    def x_first_safe(ex, ey, xmin, ymin, xmax, ymax):
+        return (ex <= xmin + tol
+                or ex >= xmax - tol
+                or ey <= ymin + tol)
+
+    y_left = y_first_safe(sx, sy, lxmin, lymin, lxmax, lymax)
+    y_right = y_first_safe(sa, sz, rxmin, rymin, rxmax, rymax)
+    x_left = x_first_safe(sx, sy, lxmin, lymin, lxmax, lymax)
+    x_right = x_first_safe(sa, sz, rxmin, rymin, rxmax, rymax)
+
+    if y_left and y_right:
+        return "y"
+    if x_left and x_right:
+        return "x"
+    # Mixed safety (rare for prismatic bodies, possible for taper). Pick
+    # whichever is safe for at least one carriage; bias to Y-first.
+    if y_left or y_right:
+        return "y"
+    return "x"
+
+
 def _normalize_body_contour(outer_pts):
     """Shift a body contour so its outer bounding-box corner sits at (0, 0).
     The returned shift should be applied to every related array (inner
@@ -1237,13 +1298,21 @@ def generate_body_gcode(
     lines.append("(Baslangic - Motor home: X0 Y0 Z0 A0)")
     lines.append("G00 X0.00 Y0.00 Z0.00 A0.00")
     lines.append("()")
-    # Body mode uses a SINGLE-LINE diagonal lead-in instead of an L-shape.
-    # Why: an L-shape would cut TWO foam slots (vertical at X=0 then
-    # horizontal at Y=start_y), totalling start_x + start_y of foam waste.
-    # A diagonal cuts ONE slot of length sqrt(start_x^2 + start_y^2),
-    # which is always shorter and uses less material.
-    lines.append("(Lead-in tek hatli: home -> dis kontur giris noktasi)")
-    lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
+    # Smart L-shape lead-in: pick Y-first or X-first so neither leg cuts
+    # through body interior. A diagonal lead-in would slice diagonally
+    # through the body for top/right entries; an L parallel to the body
+    # bbox edges stays outside (or rides exactly along an edge).
+    lead_axis = _pick_body_lead_in_axis(
+        left, right, start_x, start_y, start_a, start_z
+    )
+    if lead_axis == "y":
+        lines.append("(Lead-in L-sekli (Y-first): once Y/Z, sonra X/A)")
+        lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
+        lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
+    else:
+        lines.append("(Lead-in L-sekli (X-first): once X/A, sonra Y/Z)")
+        lines.append(f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}")
+        lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
     lines.append("()")
 
     # The toolpath array starts AT the outer entry (index 0). We've already
@@ -1276,10 +1345,16 @@ def generate_body_gcode(
     lines.append(f"G01 X{start_x:.2f} Y{start_y:.2f} Z{start_z:.2f} A{start_a:.2f} F{feed}")
     lines.append("()")
 
-    # Lead-out: reverse of lead-in — single diagonal G01 back to home.
-    # Retraces the same diagonal slot the lead-in cut, no extra material.
-    lines.append("(Lead-out tek hatli: dis kontur giris noktasi -> home)")
-    lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
+    # Lead-out: reverse of the chosen L. Retraces the same slot the
+    # lead-in cut, leaves no extra material.
+    if lead_axis == "y":
+        lines.append("(Lead-out L-sekli (Y-first): X/A 0'a, sonra Y/Z 0'a)")
+        lines.append(f"G01 X0.00 Y{start_y:.2f} Z{start_z:.2f} A0.00 F{feed}")
+        lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
+    else:
+        lines.append("(Lead-out L-sekli (X-first): Y/Z 0'a, sonra X/A 0'a)")
+        lines.append(f"G01 X{start_x:.2f} Y0.00 Z0.00 A{start_a:.2f} F{feed}")
+        lines.append(f"G01 X0.00 Y0.00 Z0.00 A0.00 F{feed}")
     lines.append("(Govde Kesim Bitti)")
 
     return "\n".join(lines)
@@ -2468,16 +2543,26 @@ class HotWireCutterApp:
         ax.plot(cl_r[:, 0], np.full(len(cl_r), span), cl_r[:, 1],
                 color="#44FF66", linewidth=2)
 
-        # Single-line diagonal lead-in/out for both carriages
+        # Smart L-shape lead-in/out for both carriages — same axis choice
+        # that generate_body_gcode will use, so the preview matches the
+        # actual G-code path exactly.
         sx = float(left[seg["outer_entry"], 0])
         sy = float(left[seg["outer_entry"], 1])
         sa = float(right[seg["outer_entry"], 0])
         sz = float(right[seg["outer_entry"], 1])
-        ax.plot([0, sx], [0, 0], [0, sy],
-                color="#FFAA00", linewidth=1.8, linestyle="--",
-                label="Lead-in / Lead-out (diagonal)")
-        ax.plot([0, sa], [span, span], [0, sz],
-                color="#FFAA00", linewidth=1.8, linestyle="--")
+        axis = _pick_body_lead_in_axis(left, right, sx, sy, sa, sz)
+        if axis == "y":
+            ax.plot([0, 0, sx], [0, 0, 0], [0, sy, sy],
+                    color="#FFAA00", linewidth=1.8, linestyle="--",
+                    label="Lead-in / Lead-out (Y-first L)")
+            ax.plot([0, 0, sa], [span, span, span], [0, sz, sz],
+                    color="#FFAA00", linewidth=1.8, linestyle="--")
+        else:
+            ax.plot([0, sx, sx], [0, 0, 0], [0, 0, sy],
+                    color="#FFAA00", linewidth=1.8, linestyle="--",
+                    label="Lead-in / Lead-out (X-first L)")
+            ax.plot([0, sa, sa], [span, span, span], [0, 0, sz],
+                    color="#FFAA00", linewidth=1.8, linestyle="--")
 
         # Home markers
         ax.scatter([0], [0], [0], color="#FFDD00", s=90, marker="s",
@@ -3027,19 +3112,29 @@ class HotWireCutterApp:
                         label=f"{label_prefix} Sag Carriage (A,Z)")
 
             # Lead-in shape depends on mode:
-            #   kanat: L-shape (vertical-first, horizontal-second) — keeps
-            #          the horizontal leg merged with the profile's bottom
-            #          edge so it doesn't leave a visible stub.
-            #   govde: single diagonal — minimises the foam slot cut by
-            #          the lead-in (one diagonal line vs. two-leg L).
+            #   kanat: Y-first L — vertical at X=0 (plot edge), then horizontal
+            #          merged with the profile's bottom edge.
+            #   govde: smart L — Y-first OR X-first depending on which one
+            #          avoids cutting through body interior. Picked by
+            #          _pick_body_lead_in_axis based on entry edge position.
             lx0 = left[0, 0]; ly0 = left[0, 1]
             rx0 = right[0, 0]; ry0 = right[0, 1]
             if tp.get("mode") == "govde":
-                ax.plot([0, lx0], [0, 0], [0, ly0],
-                        color=approach_color, linewidth=1.8, linestyle="--",
-                        label=f"{label_prefix} Lead-in / Lead-out (diagonal)")
-                ax.plot([0, rx0], [span, span], [0, ry0],
-                        color=approach_color, linewidth=1.8, linestyle="--")
+                axis = _pick_body_lead_in_axis(left, right, lx0, ly0, rx0, ry0)
+                if axis == "y":
+                    # Vertical at X=A=0, then horizontal at Y=ly0 / Z=ry0
+                    ax.plot([0, 0, lx0], [0, 0, 0], [0, ly0, ly0],
+                            color=approach_color, linewidth=1.8, linestyle="--",
+                            label=f"{label_prefix} Lead-in/out (Y-first L)")
+                    ax.plot([0, 0, rx0], [span, span, span], [0, ry0, ry0],
+                            color=approach_color, linewidth=1.8, linestyle="--")
+                else:
+                    # Horizontal at Y=Z=0, then vertical at X=lx0 / A=rx0
+                    ax.plot([0, lx0, lx0], [0, 0, 0], [0, 0, ly0],
+                            color=approach_color, linewidth=1.8, linestyle="--",
+                            label=f"{label_prefix} Lead-in/out (X-first L)")
+                    ax.plot([0, rx0, rx0], [span, span, span], [0, 0, ry0],
+                            color=approach_color, linewidth=1.8, linestyle="--")
             else:
                 ax.plot([0, 0, lx0], [0, 0, 0], [0, ly0, ly0],
                         color=approach_color, linewidth=1.8, linestyle="--",
