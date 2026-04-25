@@ -669,6 +669,54 @@ def _roll_to_vertex(points, target_xy):
     return rolled, start_idx
 
 
+def _project_onto_polygon_edges(polygon, click_xy):
+    """Find the closest point ON the polygon's edges to click_xy. Unlike
+    snap-to-vertex (which only allows corners), this lets the user click
+    anywhere along an edge — useful for entering the body or starting the
+    pocket cut at a midpoint of a face, not just at the corners.
+
+    Returns (projected_xy, edge_index, t) where the projection lies on the
+    segment from polygon[edge_index] to polygon[(edge_index+1) % n] at
+    parameter t in [0, 1]."""
+    pts = np.asarray(polygon, dtype=float)
+    target = np.asarray(click_xy, dtype=float)
+    n = len(pts)
+    best_dist = float("inf")
+    best_proj = pts[0].copy()
+    best_idx = 0
+    best_t = 0.0
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        ab = b - a
+        ab_len_sq = float(np.dot(ab, ab))
+        if ab_len_sq < 1e-12:
+            continue
+        t = float(np.dot(target - a, ab) / ab_len_sq)
+        t = max(0.0, min(1.0, t))
+        proj = a + t * ab
+        d = float(np.linalg.norm(proj - target))
+        if d < best_dist:
+            best_dist = d
+            best_proj = proj
+            best_idx = i
+            best_t = t
+    return best_proj, best_idx, best_t
+
+
+def _insert_entry_vertex(polygon, entry_xy, tol=1e-3):
+    """Ensure entry_xy is a vertex of the polygon. If it lies on an edge
+    interior (not at an existing vertex), splice it in. Returns the new
+    polygon array (possibly with one extra vertex). Used so that
+    _roll_to_vertex can lock the cut start to the user's exact pick."""
+    pts = np.asarray(polygon, dtype=float)
+    proj, edge_i, t = _project_onto_polygon_edges(pts, entry_xy)
+    # Already at a vertex? Nothing to insert.
+    if t < tol or t > 1 - tol:
+        return pts
+    return np.insert(pts, edge_i + 1, proj, axis=0)
+
+
 def _normalize_body_contour(outer_pts):
     """Shift a body contour so its outer bounding-box corner sits at (0, 0).
     The returned shift should be applied to every related array (inner
@@ -1017,6 +1065,13 @@ def build_body_machine_toolpath(
         # Force CW winding so kerf direction is consistent with kanat code
         outer_shifted = _orient_cw(_ensure_ccw(outer_shifted))
         inner_shifted = _orient_cw(_ensure_ccw(inner_shifted))
+
+        # Splice the user-picked entry as a new vertex when it sits on the
+        # interior of an edge (mid-face click). Otherwise _roll_to_vertex
+        # would snap to the closest CORNER and the actual click location
+        # would be lost.
+        outer_shifted = _insert_entry_vertex(outer_shifted, outer_entry_n)
+        inner_shifted = _insert_entry_vertex(inner_shifted, inner_entry_n)
 
         # Roll arrays so cut starts at the user-picked vertex
         outer_shifted, _ = _roll_to_vertex(outer_shifted, outer_entry_n)
@@ -1857,8 +1912,29 @@ class HotWireCutterApp:
             )
             return
 
-        has_tip = (self.body_tip_outer is not None
-                   and self.body_tip_inner is not None)
+        def _arrays_equal(a, b):
+            if a is None or b is None:
+                return False
+            if a.shape != b.shape:
+                return False
+            return np.allclose(a, b, atol=1e-6)
+
+        # If root and tip use IDENTICAL contours (same DXF on both sides for
+        # a prismatic body), only ask for 2 clicks — using the same entries
+        # for both sides keeps the wire perpendicular through the foam.
+        # Different tip clicks on identical shapes would create an
+        # asymmetric extrapolation that rotates / skews the cut.
+        same_shape = (
+            _arrays_equal(self.body_root_outer, self.body_tip_outer)
+            and _arrays_equal(self.body_root_inner, self.body_tip_inner)
+        )
+        has_separate_tip = (
+            self.body_tip_outer is not None
+            and self.body_tip_inner is not None
+            and not same_shape
+        )
+        # has_tip = old name kept for the rest of the function
+        has_tip = has_separate_tip
 
         win = tk.Toplevel(self.root)
         win.title("Sude - Govde Giris Noktasi Sec")
@@ -1954,7 +2030,8 @@ class HotWireCutterApp:
                 }[key]
                 prompt_var.set(
                     f"Adim {state['step']+1}/{len(clicks_needed)} — {pretty} "
-                    f"icin tikla. Tiklanan en yakin vertex'e snap edilir."
+                    f"icin tikla. Konturun uzerinde herhangi bir noktaya "
+                    f"(kose veya kenar ortasi) tiklanabilir."
                 )
             else:
                 prompt_var.set(
@@ -1969,16 +2046,13 @@ class HotWireCutterApp:
                 return
             key, contour, expected_ax, _ = clicks_needed[state["step"]]
             if event.inaxes is not expected_ax:
-                # Wrong subplot — silently ignore so the user knows their
-                # click didn't count.
+                # Wrong subplot — silently ignore.
                 return
             click_xy = np.array([event.xdata, event.ydata])
-            dists = np.linalg.norm(contour - click_xy, axis=1)
-            best = int(np.argmin(dists))
-            state["results"][key] = (
-                float(contour[best, 0]),
-                float(contour[best, 1]),
-            )
+            # Project to nearest point on any edge (not just nearest vertex)
+            # so the user can pick midpoints of faces, not just corners.
+            proj, _, _ = _project_onto_polygon_edges(contour, click_xy)
+            state["results"][key] = (float(proj[0]), float(proj[1]))
             state["step"] += 1
             _draw_all()
 
@@ -2224,8 +2298,187 @@ class HotWireCutterApp:
         self.canvas.create_text(w - 10, 15, text="Root (mavi) / Tip (kirmizi)",
                                 anchor=tk.E, font=("Arial", 9), fill="#555", tags="profile")
 
+    def _preview_3d_body(self):
+        """3D preview for body mode — renders the pocket+outer toolpath
+        the same way the confirm dialog does, but read-only (no commit
+        button). Lets the user verify the slot direction and outer/pocket
+        orientation before clicking G-code Uret."""
+        if self.body_root_outer is None or self.body_root_inner is None:
+            messagebox.showwarning(
+                "Uyari",
+                "Once Govde Root DXF yukleyin (dis + ic kontur iceren)."
+            )
+            return
+        if self.body_root_outer_entry is None or self.body_root_inner_entry is None:
+            messagebox.showwarning(
+                "Uyari",
+                "Giris noktalari secilmemis. 'Sec' butonu ile dis ve ic "
+                "kontur uzerinde noktalari belirle."
+            )
+            return
+
+        params = self._get_params()
+        if params is None:
+            return
+
+        # Same fallbacks as _generate_govde
+        if self.body_tip_outer is None or self.body_tip_inner is None:
+            tip_outer = self.body_root_outer
+            tip_inner = self.body_root_inner
+            tip_outer_entry = self.body_root_outer_entry
+            tip_inner_entry = self.body_root_inner_entry
+        else:
+            tip_outer = self.body_tip_outer
+            tip_inner = self.body_tip_inner
+            tip_outer_entry = (self.body_tip_outer_entry
+                               or self.body_root_outer_entry)
+            tip_inner_entry = (self.body_tip_inner_entry
+                               or self.body_root_inner_entry)
+
+        try:
+            tp = build_body_machine_toolpath(
+                self.body_root_outer, self.body_root_inner,
+                tip_outer, tip_inner,
+                self.body_root_outer_entry, self.body_root_inner_entry,
+                tip_outer_entry, tip_inner_entry,
+                params,
+            )
+        except Exception as e:
+            messagebox.showerror("Hata", f"Govde toolpath hatasi:\n{e}")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Sude - Govde 3D Onizleme")
+        win.geometry("960x720")
+        win.minsize(720, 540)
+
+        fig = plt.Figure(figsize=(11, 8), facecolor="#2b2b2b")
+        ax = fig.add_subplot(111, projection="3d", facecolor="#2b2b2b")
+
+        span = params["span"]
+        foam_w = params["foam_width"]
+        foam_lo = params["foam_left_offset"]
+
+        left = tp["left"]
+        right = tp["right"]
+        seg = tp["segments"]
+
+        segments_def = [
+            (seg["outer_entry"], seg["slot_in_end"], "#CC66FF", "Slot iceriye"),
+            (seg["slot_in_end"], seg["inner_close"], "#FF4444", "Pocket (CW)"),
+            (seg["inner_close"], seg["slot_out_end"], "#CC66FF", "Slot disariya"),
+            (seg["slot_out_end"], seg["outer_walk_end"], "#44FF66", "Dis kontur (CW)"),
+        ]
+        for s, e, color, lbl in segments_def:
+            sub_l = left[s:e + 1]
+            sub_r = right[s:e + 1]
+            ax.plot(sub_l[:, 0], np.zeros(len(sub_l)), sub_l[:, 1],
+                    color=color, linewidth=2, label=lbl)
+            ax.plot(sub_r[:, 0], np.full(len(sub_r), span), sub_r[:, 1],
+                    color=color, linewidth=2)
+        # Closing line outer_walk_end -> outer_entry
+        cl_l = np.vstack([left[seg["outer_walk_end"]], left[seg["outer_entry"]]])
+        cl_r = np.vstack([right[seg["outer_walk_end"]], right[seg["outer_entry"]]])
+        ax.plot(cl_l[:, 0], np.zeros(len(cl_l)), cl_l[:, 1],
+                color="#44FF66", linewidth=2)
+        ax.plot(cl_r[:, 0], np.full(len(cl_r), span), cl_r[:, 1],
+                color="#44FF66", linewidth=2)
+
+        # L-shaped lead-in/out for both carriages
+        sx = float(left[seg["outer_entry"], 0])
+        sy = float(left[seg["outer_entry"], 1])
+        sa = float(right[seg["outer_entry"], 0])
+        sz = float(right[seg["outer_entry"], 1])
+        ax.plot([0, 0, sx], [0, 0, 0], [0, sy, sy],
+                color="#FFAA00", linewidth=1.8, linestyle="--",
+                label="Lead-in / Lead-out (L)")
+        ax.plot([0, 0, sa], [span, span, span], [0, sz, sz],
+                color="#FFAA00", linewidth=1.8, linestyle="--")
+
+        # Home markers
+        ax.scatter([0], [0], [0], color="#FFDD00", s=90, marker="s",
+                   edgecolors="black", linewidths=1.5, label="Home (0,0)")
+        ax.scatter([0], [span], [0], color="#FFDD00", s=90, marker="s",
+                   edgecolors="black", linewidths=1.5)
+
+        # Foam block outline
+        x_min = min(left[:, 0].min(), right[:, 0].min()) - 10
+        x_max = max(left[:, 0].max(), right[:, 0].max()) + 10
+        z_max = max(left[:, 1].max(), right[:, 1].max()) + 10
+        y0, y1 = foam_lo, foam_lo + foam_w
+        for yy in [y0, y1]:
+            ax.plot([x_min, x_max, x_max, x_min, x_min],
+                    [yy, yy, yy, yy, yy],
+                    [0, 0, z_max, z_max, 0],
+                    color="cyan", linewidth=0.5, alpha=0.3)
+        for xx, zz in [(x_min, 0), (x_max, 0), (x_max, z_max), (x_min, z_max)]:
+            ax.plot([xx, xx], [y0, y1], [zz, zz],
+                    color="cyan", linewidth=0.5, alpha=0.3)
+
+        ax.set_xlabel("X / A (mm)", color="white", fontsize=10)
+        ax.set_ylabel("Span (mm)", color="white", fontsize=10)
+        ax.set_zlabel("Y / Z (mm)", color="white", fontsize=10)
+        ax.set_title("Govde 3D Onizleme - Iso  (Space: gorunum)",
+                     color="white", fontsize=11, pad=10)
+        ax.tick_params(colors="white", labelsize=8)
+        for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+            pane.fill = False
+            pane.set_edgecolor("#555555")
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="upper left", fontsize=8, facecolor="#333333",
+                  edgecolor="#555555", labelcolor="white")
+
+        canvas_widget = FigureCanvasTkAgg(fig, master=win)
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        toolbar_frame = ttk.Frame(win)
+        toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        toolbar = NavigationToolbar2Tk(canvas_widget, toolbar_frame)
+        toolbar.update()
+        canvas_widget.draw()
+        canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # SolidWorks-style view shortcuts
+        view_presets = [
+            ("Iso", 30, -45),
+            ("On", 0, -90),
+            ("Ust", 90, -90),
+            ("Yan", 0, 0),
+        ]
+        view_state = {"idx": 0}
+
+        def _apply(idx):
+            idx = idx % len(view_presets)
+            view_state["idx"] = idx
+            name, elev, azim = view_presets[idx]
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_title(
+                f"Govde 3D Onizleme - {name}  (Space: gorunum  1=Iso 2=On 3=Ust 4=Yan)",
+                color="white", fontsize=11, pad=10,
+            )
+            canvas_widget.draw()
+
+        def _key(event):
+            k = event.keysym.lower()
+            if k == "space":
+                _apply(view_state["idx"] + 1)
+            elif k in ("1", "2", "3", "4"):
+                _apply(int(k) - 1)
+
+        win.bind("<Key>", _key)
+        canvas_widget.get_tk_widget().bind("<Key>", _key)
+        canvas_widget.get_tk_widget().bind(
+            "<Button-1>", lambda e: canvas_widget.get_tk_widget().focus_set()
+        )
+        win.focus_set()
+
     def _preview_3d(self):
-        """Show 3D preview of the cutting operation."""
+        """Show 3D preview of the cutting operation. Body mode shows the
+        pocket+outer toolpath; kanat mode shows the wing geometry between
+        carriages and foam faces."""
+        if self.mode_var.get() == "govde":
+            self._preview_3d_body()
+            return
+
         if self.root_profile is None:
             messagebox.showwarning("Uyari", "Lutfen once bir Root profil DXF yukleyin!")
             return
