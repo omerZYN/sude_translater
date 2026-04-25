@@ -2569,18 +2569,52 @@ class HotWireCutterApp:
                            approach_color):
             left = tp["left"]
             right = tp["right"]
-            # Cut path closed for drawing
-            left_closed = np.vstack([left, left[0:1]])
-            right_closed = np.vstack([right, right[0:1]])
 
-            ax.plot(left_closed[:, 0], np.zeros(len(left_closed)),
-                    left_closed[:, 1],
-                    color=cut_color_left, linewidth=2,
-                    label=f"{label_prefix} Sol Carriage (X,Y)")
-            ax.plot(right_closed[:, 0], np.full(len(right_closed), span),
-                    right_closed[:, 1],
-                    color=cut_color_right, linewidth=2,
-                    label=f"{label_prefix} Sag Carriage (A,Z)")
+            if tp.get("mode") == "govde":
+                # Body mode: color-code each segment so the user can verify
+                # the slot path doesn't look weird before approving.
+                seg = tp["segments"]
+                segments_def = [
+                    # (start, end, color, label)
+                    (seg["outer_entry"], seg["slot_in_end"], "#CC66FF",
+                     f"{label_prefix} Slot iceriye"),
+                    (seg["slot_in_end"], seg["inner_close"], "#FF4444",
+                     f"{label_prefix} Pocket (CW)"),
+                    (seg["inner_close"], seg["slot_out_end"], "#CC66FF",
+                     f"{label_prefix} Slot disariya"),
+                    (seg["slot_out_end"], seg["outer_walk_end"], "#44FF66",
+                     f"{label_prefix} Dis kontur (CW)"),
+                ]
+                # Add explicit closing line outer_walk_end -> outer_entry
+                for i, (s, e, color, lbl) in enumerate(segments_def):
+                    sub_l = left[s:e + 1]
+                    sub_r = right[s:e + 1]
+                    ax.plot(sub_l[:, 0], np.zeros(len(sub_l)), sub_l[:, 1],
+                            color=color, linewidth=2,
+                            label=lbl if i < 4 else None)
+                    ax.plot(sub_r[:, 0], np.full(len(sub_r), span), sub_r[:, 1],
+                            color=color, linewidth=2)
+                # Closing segment from outer_walk_end back to outer_entry
+                cl_l = np.vstack([left[seg["outer_walk_end"]],
+                                  left[seg["outer_entry"]]])
+                cl_r = np.vstack([right[seg["outer_walk_end"]],
+                                  right[seg["outer_entry"]]])
+                ax.plot(cl_l[:, 0], np.zeros(len(cl_l)), cl_l[:, 1],
+                        color="#44FF66", linewidth=2)
+                ax.plot(cl_r[:, 0], np.full(len(cl_r), span), cl_r[:, 1],
+                        color="#44FF66", linewidth=2)
+            else:
+                # Kanat mode (single closed loop)
+                left_closed = np.vstack([left, left[0:1]])
+                right_closed = np.vstack([right, right[0:1]])
+                ax.plot(left_closed[:, 0], np.zeros(len(left_closed)),
+                        left_closed[:, 1],
+                        color=cut_color_left, linewidth=2,
+                        label=f"{label_prefix} Sol Carriage (X,Y)")
+                ax.plot(right_closed[:, 0], np.full(len(right_closed), span),
+                        right_closed[:, 1],
+                        color=cut_color_right, linewidth=2,
+                        label=f"{label_prefix} Sag Carriage (A,Z)")
 
             # L-shaped lead-in for each carriage (Y first, X second):
             #   (0, 0) -> (0, start_y) -> (start_x, start_y)
@@ -2707,8 +2741,10 @@ class HotWireCutterApp:
         bottom = ttk.Frame(win, padding=10)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
+        is_body = (body_args is not None or main_tp.get("mode") == "govde")
         info_text = (
-            f"Ana kesim: {len(main_tp['left'])} nokta  |  "
+            f"{'Govde' if is_body else 'Ana'} kesim: "
+            f"{len(main_tp['left'])} nokta  |  "
             f"Root chord: {main_tp['root_chord']:.1f}mm  |  "
             f"Tip chord: {main_tp['tip_chord']:.1f}mm  |  "
             f"Feed: {main_tp['feed']} mm/min  |  "
@@ -2716,9 +2752,20 @@ class HotWireCutterApp:
         )
         if spar_tp is not None:
             info_text += f"  |  Spar: {len(spar_tp['left'])} nokta"
-        ttk.Label(bottom, text=info_text, foreground="#333").pack(
-            side=tk.LEFT, padx=5
+
+        info_frame = ttk.Frame(bottom)
+        info_frame.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Label(info_frame, text=info_text, foreground="#333").pack(
+            side=tk.TOP, anchor=tk.W
         )
+        if is_body:
+            warn_text = (
+                "Uyari: hotwire'da rapid hareket yok — entry slot kalici "
+                "bir kesim izi birakir. Kerf yonu pocket icin otomatik "
+                "tersine cevrildi (dis: DISA, ic: ICE)."
+            )
+            ttk.Label(info_frame, text=warn_text, foreground="#B8860B",
+                      font=("Arial", 9)).pack(side=tk.TOP, anchor=tk.W)
 
         # Make the confirm button visually prominent (tk.Button supports
         # background color, ttk.Button does not on macOS)
