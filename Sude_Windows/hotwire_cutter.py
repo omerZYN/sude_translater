@@ -100,6 +100,176 @@ def _chain_entities(segments, tol=0.5):
     return chain
 
 
+def _polygon_signed_area(points):
+    """Shoelace signed area. Positive => CCW, negative => CW.
+    Used both to gauge polygon size (abs value) and winding direction."""
+    if len(points) < 3:
+        return 0.0
+    pts = np.asarray(points, dtype=float)
+    if np.allclose(pts[0], pts[-1], atol=1e-6):
+        pts = pts[:-1]
+    xs = pts[:, 0]
+    ys = pts[:, 1]
+    return 0.5 * float(
+        np.sum(xs * np.roll(ys, -1) - np.roll(xs, -1) * ys)
+    )
+
+
+def _point_in_polygon(point, polygon):
+    """Ray-casting point-in-polygon test. Returns True if (x,y) is inside.
+    Used to identify which closed contour from a DXF is the OUTER one
+    (contains all others) and which are inner pockets."""
+    poly = np.asarray(polygon, dtype=float)
+    if len(poly) < 3:
+        return False
+    if np.allclose(poly[0], poly[-1], atol=1e-6):
+        poly = poly[:-1]
+    x, y = float(point[0]), float(point[1])
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        # Edge crosses the horizontal ray from (x,y) to +inf
+        if ((yi > y) != (yj > y)):
+            x_intersect = (xj - xi) * (y - yi) / (yj - yi + 1e-30) + xi
+            if x < x_intersect:
+                inside = not inside
+        j = i
+    return inside
+
+
+def extract_all_closed_contours(filepath, min_perimeter=1.0):
+    """Extract every closed polyline/spline from a DXF as a list of Nx2 arrays.
+
+    For govde (body) mode the DXF must contain at least two closed contours:
+    the outer body shape and one (or more) inner pockets to be removed. This
+    helper returns all of them; the caller classifies outer vs inner via
+    Shoelace area + point-in-polygon.
+
+    Recognized entities (each yields one contour if closed):
+        LWPOLYLINE (closed flag OR start=end)
+        POLYLINE   (is_closed flag OR start=end)
+        SPLINE     (closed flag)
+        CIRCLE     (always closed — discretized)
+
+    Open chains (LINE/ARC fragments) are also assembled as a fallback for
+    DXFs whose outer outline is drawn as separate segments. We try chaining
+    once, and the resulting closed loop is added if it isn't a duplicate of
+    an entity-level loop already collected.
+
+    min_perimeter filters out tiny degenerate loops (e.g. duplicate vertices
+    that form a 0-length closed shape).
+    """
+    doc = ezdxf.readfile(filepath)
+    msp = doc.modelspace()
+
+    contours = []
+
+    def _add(pts):
+        if len(pts) < 3:
+            return
+        arr = np.asarray(pts, dtype=float)
+        # Drop duplicate closing vertex
+        if np.allclose(arr[0], arr[-1], atol=1e-6):
+            arr = arr[:-1]
+        if len(arr) < 3:
+            return
+        # Reject tiny loops
+        deltas = np.diff(np.vstack([arr, arr[:1]]), axis=0)
+        perimeter = float(np.sum(np.sqrt(np.sum(deltas ** 2, axis=1))))
+        if perimeter < min_perimeter:
+            return
+        contours.append(arr)
+
+    for entity in msp.query("LWPOLYLINE"):
+        pts = list(entity.get_points(format="xy"))
+        if entity.closed or (len(pts) > 2 and np.allclose(pts[0], pts[-1], atol=0.01)):
+            _add(pts)
+
+    for entity in msp.query("POLYLINE"):
+        if not (entity.is_2d_polyline or entity.is_3d_polyline):
+            continue
+        pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+        if entity.is_closed or (len(pts) > 2 and np.allclose(pts[0], pts[-1], atol=0.01)):
+            _add(pts)
+
+    for entity in msp.query("SPLINE"):
+        if entity.closed:
+            pts = [(p.x, p.y) for p in entity.flattening(0.1)]
+            _add(pts)
+
+    for entity in msp.query("CIRCLE"):
+        cx, cy = entity.dxf.center.x, entity.dxf.center.y
+        r = float(entity.dxf.radius)
+        # 64-vertex circle approximation — enough density for hotwire
+        thetas = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+        pts = [(cx + r * np.cos(t), cy + r * np.sin(t)) for t in thetas]
+        _add(pts)
+
+    # Fallback: assemble loose entities into chains (handles DXFs where
+    # the outer outline is a sequence of LINE/ARC segments instead of one
+    # LWPOLYLINE).
+    if len(contours) < 2:
+        all_entities = list(msp)
+        # Skip entities that already produced a contour above
+        used_types = ("LWPOLYLINE", "POLYLINE", "SPLINE", "CIRCLE")
+        segments = []
+        for entity in all_entities:
+            if entity.dxftype() in used_types:
+                continue
+            seg = _flatten_entity(entity)
+            if len(seg) >= 2:
+                segments.append(seg)
+        if segments:
+            chain = _chain_entities(segments, tol=0.5)
+            if (
+                len(chain) > 4
+                and np.linalg.norm(np.array(chain[0]) - np.array(chain[-1])) < 1.0
+            ):
+                _add(chain)
+
+    return contours
+
+
+def classify_outer_inner(contours):
+    """Given a list of closed contour arrays (Nx2), return (outer, inner_list)
+    where outer is the largest-area contour that geometrically CONTAINS the
+    others. Inner contours are returned in descending-area order.
+
+    Raises ValueError if no outer can be found or if the largest contour does
+    not actually contain the others (DXF likely has unrelated shapes).
+    """
+    if not contours:
+        raise ValueError("DXF dosyasinda kapali kontur bulunamadi.")
+    if len(contours) == 1:
+        # Caller can decide whether one contour is enough (kanat mode) or
+        # an error (govde mode requires >= 2).
+        return contours[0], []
+
+    areas = [abs(_polygon_signed_area(c)) for c in contours]
+    order = sorted(range(len(contours)), key=lambda i: -areas[i])
+    outer = contours[order[0]]
+    inner = []
+    for idx in order[1:]:
+        candidate = contours[idx]
+        # Test a representative point of the candidate (its centroid)
+        cx = float(np.mean(candidate[:, 0]))
+        cy = float(np.mean(candidate[:, 1]))
+        if _point_in_polygon((cx, cy), outer):
+            inner.append(candidate)
+        else:
+            # Not contained by the largest — DXF probably has disconnected
+            # shapes. We refuse to guess; user must clean up the DXF.
+            raise ValueError(
+                "DXF'te birbirinden bagimsiz kapali konturlar var. "
+                "Govde modu icin sadece bir dis kontur ve ic pocket(ler) "
+                "icermelidir."
+            )
+    return outer, inner
+
+
 def extract_profile_from_dxf(filepath):
     """Extract closed polyline/spline coordinates from a DXF file."""
     doc = ezdxf.readfile(filepath)
@@ -844,6 +1014,25 @@ DXF_TOOLTIPS = {
         "Yuklenirse ana kesim bittikten sonra ayri bir G-code bolumunde "
         "kesilir. Bos birakilabilir."
     ),
+    "body_root": (
+        "Govde root profil DXF (sol / govde kok kesiti).\n\n"
+        "Govde modunda kullanilir. DXF'in icinde IKI kapali kontur olmasi "
+        "gerekir: dis kontur (govdenin disi) + ic kontur (bosaltilacak "
+        "pocket). Program ikisini otomatik ayirir."
+    ),
+    "body_tip": (
+        "Govde tip profil DXF (sag / govde uc kesiti).\n\n"
+        "Tapered govde icin sag kesit. Duz prizmatik govdede bos "
+        "birakilabilir; root profili her iki tarafta da kullanilir."
+    ),
+    "body_entry": (
+        "Pocket giris noktalari (tiklamali secim).\n\n"
+        "Tikla butonunu kullanarak, dis kontur uzerinde wire'in govdeye "
+        "girdigi noktayi VE ic kontur uzerinde pocket kesimini baslattigin "
+        "noktayi sec. Bu iki nokta arasinda duz bir slot kesilir; sonra "
+        "pocket CW dondurulur, slot geri sarilir, ardindan dis kontur "
+        "kesilir."
+    ),
 }
 
 
@@ -863,6 +1052,23 @@ class HotWireCutterApp:
         self.spar_dxf_path = None
         self.generated_gcode = None
 
+        # Body (govde) mode state — populated when user is in "Govde Kesim" mode
+        # and loads DXFs that contain TWO closed contours (outer body shape +
+        # inner pocket to be removed). Each profile is split into outer/inner
+        # arrays. Entry points are picked by the user via a click-select
+        # dialog and used to route the wire from the outer contour through
+        # the body material into the inner pocket.
+        self.body_root_outer = None
+        self.body_root_inner = None
+        self.body_tip_outer = None
+        self.body_tip_inner = None
+        self.body_root_dxf_path = None
+        self.body_tip_dxf_path = None
+        self.body_root_outer_entry = None  # (x, y) on root outer contour
+        self.body_root_inner_entry = None  # (x, y) on root inner contour
+        self.body_tip_outer_entry = None
+        self.body_tip_inner_entry = None
+
         self._build_ui()
         self._load_settings()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -881,6 +1087,10 @@ class HotWireCutterApp:
             if key == "profile_name":
                 if hasattr(self, "profile_name_var"):
                     self.profile_name_var.set(str(val))
+            elif key == "mode":
+                if hasattr(self, "mode_var") and val in ("kanat", "govde"):
+                    self.mode_var.set(str(val))
+                    self._on_mode_change()
             elif key in self.param_vars:
                 try:
                     self.param_vars[key].set(str(val))
@@ -893,6 +1103,8 @@ class HotWireCutterApp:
         interrupt the workflow."""
         data = {key: var.get() for key, var in self.param_vars.items()}
         data["profile_name"] = self.profile_name_var.get()
+        if hasattr(self, "mode_var"):
+            data["mode"] = self.mode_var.get()
         try:
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(data, f, indent=2)
@@ -926,8 +1138,27 @@ class HotWireCutterApp:
             Tooltip(lbl, tip_text)
             return lbl
 
+        # Mode selector: Kanat (single closed profile) vs Govde (outer + inner
+        # pocket). The mode controls which set of DXF loaders is visible and
+        # which toolpath generator runs at G-code time.
+        self.mode_var = tk.StringVar(value="kanat")
+        mode_frame = ttk.Frame(file_frame)
+        mode_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(mode_frame, text="Kesim Modu:",
+                  font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_frame, text="Kanat", value="kanat",
+                        variable=self.mode_var,
+                        command=self._on_mode_change).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(mode_frame, text="Govde", value="govde",
+                        variable=self.mode_var,
+                        command=self._on_mode_change).pack(side=tk.LEFT, padx=4)
+
+        # --- Kanat (wing) file loaders ---
+        self.kanat_files_frame = ttk.Frame(file_frame)
+        self.kanat_files_frame.pack(fill=tk.X)
+
         # Root DXF
-        rf = ttk.Frame(file_frame)
+        rf = ttk.Frame(self.kanat_files_frame)
         rf.pack(fill=tk.X, pady=2)
         ttk.Label(rf, text="Root Profil:").pack(side=tk.LEFT)
         _info_icon(rf, DXF_TOOLTIPS["root"]).pack(side=tk.LEFT)
@@ -936,7 +1167,7 @@ class HotWireCutterApp:
         ttk.Button(rf, text="Yukle", command=self._load_root).pack(side=tk.RIGHT)
 
         # Tip DXF
-        tf = ttk.Frame(file_frame)
+        tf = ttk.Frame(self.kanat_files_frame)
         tf.pack(fill=tk.X, pady=2)
         ttk.Label(tf, text="Tip Profil:  ").pack(side=tk.LEFT)
         _info_icon(tf, DXF_TOOLTIPS["tip"]).pack(side=tk.LEFT)
@@ -945,7 +1176,7 @@ class HotWireCutterApp:
         ttk.Button(tf, text="Yukle", command=self._load_tip).pack(side=tk.RIGHT)
 
         # Spar DXF
-        sf = ttk.Frame(file_frame)
+        sf = ttk.Frame(self.kanat_files_frame)
         sf.pack(fill=tk.X, pady=2)
         ttk.Label(sf, text="Spar Profil: ").pack(side=tk.LEFT)
         _info_icon(sf, DXF_TOOLTIPS["spar"]).pack(side=tk.LEFT)
@@ -953,13 +1184,57 @@ class HotWireCutterApp:
         self.spar_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(sf, text="Yukle", command=self._load_spar).pack(side=tk.RIGHT)
 
-        # Profile name
+        # --- Govde (body) file loaders --- hidden until user picks govde mode
+        self.body_files_frame = ttk.Frame(file_frame)
+        # NOT packed initially — _on_mode_change controls visibility
+
+        brf = ttk.Frame(self.body_files_frame)
+        brf.pack(fill=tk.X, pady=2)
+        ttk.Label(brf, text="Govde Root:").pack(side=tk.LEFT)
+        _info_icon(brf, DXF_TOOLTIPS["body_root"]).pack(side=tk.LEFT)
+        self.body_root_label = ttk.Label(
+            brf, text="Yuklenmedi (dis + ic kontur olmali)", foreground="gray"
+        )
+        self.body_root_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(brf, text="Yukle",
+                   command=self._load_body_root).pack(side=tk.RIGHT)
+
+        btf = ttk.Frame(self.body_files_frame)
+        btf.pack(fill=tk.X, pady=2)
+        ttk.Label(btf, text="Govde Tip: ").pack(side=tk.LEFT)
+        _info_icon(btf, DXF_TOOLTIPS["body_tip"]).pack(side=tk.LEFT)
+        self.body_tip_label = ttk.Label(
+            btf, text="Yuklenmedi (duz govde icin bos birakin)",
+            foreground="gray"
+        )
+        self.body_tip_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(btf, text="Yukle",
+                   command=self._load_body_tip).pack(side=tk.RIGHT)
+
+        # Entry-point selection button (Step 3 fills in the click dialog)
+        bef = ttk.Frame(self.body_files_frame)
+        bef.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(bef, text="Giris Noktasi:").pack(side=tk.LEFT)
+        _info_icon(bef, DXF_TOOLTIPS["body_entry"]).pack(side=tk.LEFT)
+        self.body_entry_label = ttk.Label(
+            bef, text="Secilmedi", foreground="gray"
+        )
+        self.body_entry_label.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(bef, text="Sec",
+                   command=self._select_body_entry).pack(side=tk.RIGHT)
+
+        # Profile name (shared between modes)
         nf = ttk.Frame(file_frame)
         nf.pack(fill=tk.X, pady=(5, 0))
         ttk.Label(nf, text="Profil Adi:").pack(side=tk.LEFT)
         _info_icon(nf, PARAM_TOOLTIPS["profile_name"]).pack(side=tk.LEFT)
         self.profile_name_var = tk.StringVar(value="NACA2412")
         ttk.Entry(nf, textvariable=self.profile_name_var, width=20).pack(side=tk.LEFT, padx=5)
+
+        # Stash the profile-name row so _on_mode_change can re-insert the
+        # active loader frame BEFORE it (otherwise pack_forget+pack puts the
+        # re-shown frame at the bottom, below the profile name).
+        self._files_anchor_after = nf
 
         # --- Right: Parameters ---
         param_frame = ttk.LabelFrame(top, text="Kesim Parametreleri", padding=8)
@@ -1085,6 +1360,106 @@ class HotWireCutterApp:
             self.status_var.set(f"Spar profil yuklendi: {len(pts)} nokta")
         except Exception as e:
             messagebox.showerror("Hata", f"Spar DXF okunamadi:\n{e}")
+
+    def _on_mode_change(self):
+        """Switch the visible DXF-loader frame to match the current mode.
+        Called by the Kanat/Govde radio buttons."""
+        mode = self.mode_var.get()
+        anchor = getattr(self, "_files_anchor_after", None)
+        if mode == "kanat":
+            self.body_files_frame.pack_forget()
+            if anchor is not None:
+                self.kanat_files_frame.pack(fill=tk.X, before=anchor)
+            else:
+                self.kanat_files_frame.pack(fill=tk.X)
+            self.status_var.set("Mod: Kanat Kesim")
+        else:  # govde
+            self.kanat_files_frame.pack_forget()
+            if anchor is not None:
+                self.body_files_frame.pack(fill=tk.X, before=anchor)
+            else:
+                self.body_files_frame.pack(fill=tk.X)
+            self.status_var.set(
+                "Mod: Govde Kesim — DXF'inde dis + ic kontur olmali."
+            )
+
+    def _load_body_dxf(self, side):
+        """Load a govde DXF for either side ('root' or 'tip'). Splits the
+        DXF into outer + first-inner contour using extract_all_closed_contours
+        + classify_outer_inner. The first inner contour is the pocket to be
+        cut; if multiple inner contours are present we warn but only use
+        the largest one (single-pocket assumption per the design)."""
+        title = "Govde Root DXF Sec" if side == "root" else "Govde Tip DXF Sec"
+        path = self._load_dxf(title)
+        if not path:
+            return
+        try:
+            contours = extract_all_closed_contours(path)
+            if len(contours) < 2:
+                messagebox.showerror(
+                    "Hata",
+                    f"Govde DXF'te en az 2 kapali kontur olmali "
+                    f"(dis + ic pocket). Bulunan: {len(contours)}.\n\n"
+                    "DXF'i kontrol et: dis govde + ic bosluk ayri ayri "
+                    "kapali sekiller olmali."
+                )
+                return
+            outer, inners = classify_outer_inner(contours)
+            if len(inners) > 1:
+                messagebox.showwarning(
+                    "Uyari",
+                    f"DXF'te {len(inners)} ic kontur var; su an tek pocket "
+                    "destekleniyor. Sadece en buyuk ic kontur kullanilacak."
+                )
+            inner = inners[0]
+            label = self.body_root_label if side == "root" else self.body_tip_label
+            name = os.path.basename(path)
+            if side == "root":
+                self.body_root_outer = outer
+                self.body_root_inner = inner
+                self.body_root_dxf_path = path
+                # Reset entry points — DXF changed, old picks aren't meaningful
+                self.body_root_outer_entry = None
+                self.body_root_inner_entry = None
+                self.body_entry_label.config(text="Secilmedi", foreground="gray")
+            else:
+                self.body_tip_outer = outer
+                self.body_tip_inner = inner
+                self.body_tip_dxf_path = path
+                self.body_tip_outer_entry = None
+                self.body_tip_inner_entry = None
+            label.config(
+                text=f"{name}  [dis: {len(outer)} nk, ic: {len(inner)} nk]",
+                foreground="blue" if side == "root" else "red",
+            )
+            self.status_var.set(
+                f"Govde {side} yuklendi — dis kontur {len(outer)} nokta, "
+                f"ic kontur {len(inner)} nokta."
+            )
+        except Exception as e:
+            messagebox.showerror("Hata", f"Govde DXF okunamadi:\n{e}")
+
+    def _load_body_root(self):
+        self._load_body_dxf("root")
+
+    def _load_body_tip(self):
+        self._load_body_dxf("tip")
+
+    def _select_body_entry(self):
+        """Open the click-select dialog for pocket entry points.
+        Stub for Step 1 — Step 3 implements the matplotlib click handling."""
+        if self.body_root_outer is None:
+            messagebox.showwarning(
+                "Uyari",
+                "Once Govde Root DXF yukleyin."
+            )
+            return
+        messagebox.showinfo(
+            "Bilgi",
+            "Tiklamali giris noktasi secimi Step 3'te eklenecek.\n\n"
+            "Su an Step 1: mod toggle ve dosya yukleyiciler kuruldu. "
+            "Sonraki adimlarda DXF parser + secim diyalogu eklenecek."
+        )
 
     def _get_params(self):
         try:
