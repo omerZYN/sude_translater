@@ -52,6 +52,83 @@ def _flatten_entity(entity):
     return []
 
 
+def _chain_all_closed_loops(segments, tol=0.5):
+    """Greedily chain a list of point-segments into ALL closed loops.
+
+    Used for DXFs whose outlines are drawn as separate LINE/ARC fragments
+    rather than a single LWPOLYLINE. Unlike _chain_entities (which builds
+    one chain), this peels off loops one at a time:
+
+        1. Seed a chain with the longest remaining segment.
+        2. Extend its tail with the closest remaining segment until either
+           the chain closes (tail near start) or no nearby segment exists.
+        3. If the chain closed, save it as a loop. Either way, drop the
+           used segments and start a fresh chain from the longest of what's
+           left. Repeat until nothing is left.
+
+    Crucially, when the user's body DXF contains an outer rectangle (4
+    lines) and an inner pocket rectangle (4 lines), step 2 closes the
+    outer loop after the 4th line — and step 3 then peels the inner loop
+    from the remaining 4 lines.
+
+    Open chains that never closed are discarded (might be stray LINE
+    entities like dimensions, not part of any contour)."""
+    if not segments:
+        return []
+
+    loops = []
+    remaining = [list(s) for s in segments]
+
+    while remaining:
+        seed_idx = max(range(len(remaining)),
+                       key=lambda i: len(remaining[i]))
+        chain = remaining.pop(seed_idx)
+
+        # Extend the chain greedily
+        while remaining:
+            # Already closed?
+            if (len(chain) > 2
+                and np.linalg.norm(
+                    np.array(chain[0]) - np.array(chain[-1])
+                ) < tol):
+                break
+
+            tail = np.array(chain[-1])
+            best_i = None
+            best_flip = False
+            best_dist = float("inf")
+            for i, seg in enumerate(remaining):
+                d_start = np.linalg.norm(tail - np.array(seg[0]))
+                d_end = np.linalg.norm(tail - np.array(seg[-1]))
+                if d_start < best_dist:
+                    best_dist = d_start
+                    best_i = i
+                    best_flip = False
+                if d_end < best_dist:
+                    best_dist = d_end
+                    best_i = i
+                    best_flip = True
+
+            if best_i is None or best_dist > tol * 50:
+                break
+
+            seg = remaining.pop(best_i)
+            if best_flip:
+                seg = list(reversed(seg))
+            if np.linalg.norm(np.array(chain[-1]) - np.array(seg[0])) < tol:
+                seg = seg[1:]
+            chain.extend(seg)
+
+        # Save only if the chain ended up closed
+        if (len(chain) > 2
+            and np.linalg.norm(
+                np.array(chain[0]) - np.array(chain[-1])
+            ) < 1.0):
+            loops.append(chain)
+
+    return loops
+
+
 def _chain_entities(segments, tol=0.5):
     """Chain a list of point-segments into a single ordered point list.
     Each segment is a list of (x,y) points. We find the order that connects
@@ -208,12 +285,12 @@ def extract_all_closed_contours(filepath, min_perimeter=1.0):
         pts = [(cx + r * np.cos(t), cy + r * np.sin(t)) for t in thetas]
         _add(pts)
 
-    # Fallback: assemble loose entities into chains (handles DXFs where
-    # the outer outline is a sequence of LINE/ARC segments instead of one
-    # LWPOLYLINE).
+    # Fallback: assemble loose LINE/ARC fragments into closed loops. Unlike
+    # the kanat-only flow, body DXFs may contain MULTIPLE disjoint loops
+    # (outer body + inner pocket) drawn as individual segments — so we
+    # extract all closed loops, not just the first.
     if len(contours) < 2:
         all_entities = list(msp)
-        # Skip entities that already produced a contour above
         used_types = ("LWPOLYLINE", "POLYLINE", "SPLINE", "CIRCLE")
         segments = []
         for entity in all_entities:
@@ -223,12 +300,8 @@ def extract_all_closed_contours(filepath, min_perimeter=1.0):
             if len(seg) >= 2:
                 segments.append(seg)
         if segments:
-            chain = _chain_entities(segments, tol=0.5)
-            if (
-                len(chain) > 4
-                and np.linalg.norm(np.array(chain[0]) - np.array(chain[-1])) < 1.0
-            ):
-                _add(chain)
+            for loop in _chain_all_closed_loops(segments, tol=0.5):
+                _add(loop)
 
     return contours
 
